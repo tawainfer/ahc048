@@ -3,6 +3,9 @@ using System.Collections;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using static System.Console;
+using static Program;
+using System.Collections.ObjectModel;
+using System.Security;
 
 public static class Extensions
 {
@@ -56,228 +59,241 @@ public interface IMonoidOperator<T>
 }
 
 /// <summary>
-/// 動的グラフの連結性を管理するクラス（削除可能なUnion-Find）。
+/// 動的グラフの連結性を管理するクラス（削除可能なUnion-Findデータ構造）。
 /// Euler Tour Treeを階層的に利用して、辺の追加と削除を効率的に処理します。
+/// 連結成分ごとの集約値や、個々の頂点の値も管理できます。
 /// </summary>
 /// <typeparam name="T">各頂点に関連付ける値の型。IMonoidOperator&lt;T&gt;によって集約操作が定義される必要があります。</typeparam>
 public class DynamicConnectivity<T>
 {
-  private readonly IMonoidOperator<T> _operator;
-  private readonly List<EulerTourTree> _ett;
-  private readonly List<List<HashSet<int>>> _edges; // 各レベルの非ツリーエッジの隣接リスト
-  private readonly int _sz; // グラフの頂点数
-  private int _dep = 1; // 現在のレベル数 (1から始まる)
+  private readonly IMonoidOperator<T> _monoidOperator;
+  private readonly List<EulerTourTree> _eulerTourTrees;
+  private readonly List<List<HashSet<int>>> _nonTreeEdgesByLevel;
+  private readonly int _vertexCount;
+  private int _levelCount = 1; // 利用しているETTのレベル数 (1から始まる)
 
   /// <summary>
-  /// Euler Tour Treeを表す内部クラス。
-  /// 各レベルの連結性を管理します。
+  /// Euler Tour Tree (ETT) を表す内部クラス。
+  /// 各階層レベルにおけるグラフの森の構造と、関連する集約値を管理します。
   /// </summary>
   private class EulerTourTree
   {
-    private readonly IMonoidOperator<T> _opETT;
-    private List<Dictionary<int, Node>> _ptr; // 辺(l,r)および頂点(i,i)に対応するノードを管理するポインタのリスト。
+    private readonly IMonoidOperator<T> _monoidOpETT;
+    private List<Dictionary<int, Node>> _vertexPairToNodeMap; // (endpoint1, endpoint2) -> Node のマッピング
 
     /// <summary>
     /// Euler Tour Treeのノードを表す内部クラス。
-    /// Splay Treeのノードとして機能します。
+    /// Splay Treeのノードとして機能し、頂点または辺（オイラーツアーの弧）を表します。
     /// </summary>
     internal class Node
     {
       /// <summary>
-      /// [0]が左の子、[1]が右の子。
+      /// 子ノードの配列。[0]が左の子、[1]が右の子。
       /// </summary>
-      public Node?[] Ch { get; } = new Node?[2];
+      public Node?[] Children { get; } = new Node?[2];
       /// <summary>
-      /// 親ノード。
+      /// 親ノード。根の場合はnull。
       /// </summary>
-      public Node? P { get; set; }
+      public Node? Parent { get; set; }
       /// <summary>
-      /// このノードが表す辺の始点、または頂点のID。
+      /// このノードが表す区間または辺の始点、あるいは頂点のID。
       /// </summary>
-      public int L { get; }
+      public int Endpoint1 { get; }
       /// <summary>
-      /// このノードが表す辺の終点、または頂点のID。頂点ノードの場合はLと同じ。
+      /// このノードが表す区間または辺の終点、あるいは頂点のID。頂点ノードの場合はEndpoint1と同じ。
       /// </summary>
-      public int R { get; }
+      public int Endpoint2 { get; }
       /// <summary>
-      /// このノードを根とする部分木のサイズ（頂点ノードの数）。
+      /// このノードを根とするSplay Treeの部分木に含まれる「頂点ノード」の数。
       /// </summary>
-      public int Sz { get; set; }
+      public int SubtreeSize { get; set; }
       /// <summary>
-      /// このノード（頂点の場合）に関連付けられた値。
+      /// このノードが頂点を表す場合、その頂点に直接関連付けられた値。
       /// </summary>
-      public T Val { get; set; }
+      public T Value { get; set; }
       /// <summary>
-      /// このノードを根とする部分木の集約値。
+      /// このノードを根とするSplay Treeの部分木に含まれる全頂点ノードのValueの集約値。
       /// </summary>
-      public T Sum { get; set; }
+      public T AggregatedValue { get; set; }
       /// <summary>
-      /// このノードが辺を表し(L < R)、まだ処理されていない（上位レベルに昇格する可能性がある）かを示すフラグ。
+      /// このノードが辺（Endpoint1 < Endpoint2）を表し、かつまだ処理されていない（上位レベルに昇格する可能性がある）場合にtrue。
       /// </summary>
-      public bool Exact { get; set; }
+      public bool IsExactEdge { get; set; }
       /// <summary>
-      /// 子孫にExactなノードが存在するかを示すフラグ。
+      /// このノードを根とする部分木内に、IsExactEdgeがtrueのノードが存在する場合にtrue。
       /// </summary>
-      public bool ChildExact { get; set; }
+      public bool HasExactEdgeInChildren { get; set; }
       /// <summary>
-      /// この頂点ノードが、現在のETTレベルで非ツリーエッジに接続されているかを示すフラグ。
+      /// このノードが頂点を表す場合、現在のETTレベルで非ツリーエッジに接続されている場合にtrue。
       /// </summary>
-      public bool EdgeConnected { get; set; }
+      public bool IsNonTreeEdgeConnected { get; set; }
       /// <summary>
-      /// 子孫にEdgeConnectedなノードが存在するかを示すフラグ。
+      /// このノードを根とする部分木内に、IsNonTreeEdgeConnectedがtrueの頂点ノードが存在する場合にtrue。
       /// </summary>
-      public bool ChildEdgeConnected { get; set; }
+      public bool HasNonTreeEdgeConnectedChild { get; set; }
 
       /// <summary>
       /// Nodeの新しいインスタンスを初期化します。
       /// </summary>
-      /// <param name="l">始点または頂点ID。</param>
-      /// <param name="r">終点または頂点ID。</param>
-      /// <param name="identityElementForNode">このノードのValとSumの初期値となる単位元。</param>
-      public Node(int l, int r, T identityElementForNode)
+      /// <param name="endpoint1">始点または頂点ID。</param>
+      /// <param name="endpoint2">終点または頂点ID。</param>
+      /// <param name="identityValue">このノードのValueとAggregatedValueの初期値となる単位元。</param>
+      public Node(int endpoint1, int endpoint2, T identityValue)
       {
-        L = l;
-        R = r;
-        Val = identityElementForNode; // ノード生成時は渡された単位元で初期化
-        Sum = identityElementForNode;
-        Sz = (l == r) ? 1 : 0; // 頂点ノードならサイズ1、辺ノードなら0
-        Exact = (l < r);      // 辺ノードならtrue
-        ChildExact = (l < r); // 初期状態では自身がExactならtrue
+        Endpoint1 = endpoint1;
+        Endpoint2 = endpoint2;
+        Value = identityValue;
+        AggregatedValue = identityValue;
+        SubtreeSize = (endpoint1 == endpoint2) ? 1 : 0;
+        IsExactEdge = (endpoint1 < endpoint2);
+        HasExactEdgeInChildren = IsExactEdge;
       }
 
       /// <summary>
-      /// このノードが根であるかどうかを判断します。
+      /// このノードがSplay Treeの根であるかどうかを判断します。
       /// </summary>
       /// <returns>根であればtrue、そうでなければfalse。</returns>
-      public bool IsRoot() => P == null;
+      public bool IsRoot() => Parent == null;
     }
-
 
     /// <summary>
     /// EulerTourTreeの新しいインスタンスを初期化します。
     /// </summary>
-    /// <param name="size">グラフの頂点数。</param>
-    /// <param name="monoidOperator">値を集約するためのオペレータ。</param>
-    public EulerTourTree(int size, IMonoidOperator<T> monoidOperator)
+    /// <param name="vertexCount">このETTが管理するグラフの頂点数。</param>
+    /// <param name="monoidOperator">値の集約に使用するモノイド演算子。</param>
+    public EulerTourTree(int vertexCount, IMonoidOperator<T> monoidOperator)
     {
-      _opETT = monoidOperator;
-      _ptr = new List<Dictionary<int, Node>>(size);
-      for (int i = 0; i < size; i++)
+      _monoidOpETT = monoidOperator;
+      _vertexPairToNodeMap = new List<Dictionary<int, Node>>(vertexCount);
+      for (int i = 0; i < vertexCount; i++)
       {
-        _ptr.Add(new Dictionary<int, Node>());
-        _ptr[i][i] = new Node(i, i, _opETT.Identity); // 各頂点iに対応するノード(i,i)を作成
+        _vertexPairToNodeMap.Add(new Dictionary<int, Node>());
+        _vertexPairToNodeMap[i][i] = new Node(i, i, _monoidOpETT.Identity);
       }
     }
 
     /// <summary>
-    /// 指定されたl, rに対応するノードを取得または作成します。
+    /// 指定された端点ペアに対応するノードを取得または作成します。
+    /// (endpoint1, endpoint1) は頂点ノードを、(endpoint1, endpoint2) で endpoint1 < endpoint2 は辺ノードを表します。
     /// </summary>
-    private Node GetNode(int l, int r)
+    private Node GetNode(int endpoint1, int endpoint2)
     {
-      if (!_ptr[l].TryGetValue(r, out var node))
+      if (endpoint1 < 0 || endpoint1 >= _vertexPairToNodeMap.Count)
       {
-        node = new Node(l, r, _opETT.Identity); // 新規作成時はオペレータの単位元で初期化
-        _ptr[l][r] = node;
+        throw new ArgumentOutOfRangeException(nameof(endpoint1), "Vertex index for endpoint1 is out of bounds.");
+      }
+      // endpoint2の範囲チェックも、もしendpoint1 != endpoint2 の場合に必要なら追加
+      if (!_vertexPairToNodeMap[endpoint1].TryGetValue(endpoint2, out Node? node) || node == null)
+      {
+        node = new Node(endpoint1, endpoint2, _monoidOpETT.Identity);
+        _vertexPairToNodeMap[endpoint1][endpoint2] = node;
       }
       return node;
     }
 
     /// <summary>
-    /// 指定されたノードが属する木の根を返します。
+    /// 指定されたノードが属するSplay Treeの根ノードを探索します。
     /// </summary>
-    private Node? Root(Node? t)
+    private Node? FindRoot(Node? node)
     {
-      if (t == null) return null;
-      while (t.P != null) t = t.P;
-      return t;
-    }
-
-    /// <summary>
-    /// 2つのノードが同じ木に属するかどうかを判断します。
-    /// </summary>
-    public bool Same(Node? s, Node? t)
-    {
-      if (s != null) Splay(s);
-      if (t != null) Splay(t);
-      return Root(s) == Root(t);
-    }
-
-    /// <summary>
-    /// 指定されたノードを木の新しい根にします（オイラーツアーの始点を変更）。
-    /// </summary>
-    private Node? Reroot(Node t)
-    {
-      var (s1, s2) = Split(t);
-      return Merge(s2, s1);
-    }
-
-    /// <summary>
-    /// 指定されたノードsで木を分割します。sは分割後の右側の木の根になります。
-    /// </summary>
-    /// <returns>左側の木と右側の木（sを根とする）。</returns>
-    private (Node? left, Node? right) Split(Node s)
-    {
-      Splay(s);
-      Node? t = s.Ch[0];
-      if (t != null) t.P = null;
-      s.Ch[0] = null;
-      return (t, Update(s));
-    }
-
-    /// <summary>
-    /// 指定されたノードsで木を分割し、sの左右の子木をそれぞれ独立させます。
-    /// s自体は単一ノードの木になります。
-    /// </summary>
-    /// <returns>元のsの左の子木と右の子木。</returns>
-    private (Node? left, Node? right) Split2(Node s)
-    {
-      Splay(s);
-      Node? t = s.Ch[0];
-      Node? u = s.Ch[1];
-      if (t != null) t.P = null;
-      s.Ch[0] = null;
-      if (u != null) u.P = null;
-      s.Ch[1] = null;
-      Update(s);
-      return (t, u);
-    }
-
-    /// <summary>
-    /// 2つのエッジノードsとtに基づいて木を3つに分割します。
-    /// </summary>
-    public (Node? s1, Node? s2, Node? s3) Split(Node s, Node t)
-    {
-      var u = Split2(s);
-      if (Same(u.left, t))
+      if (node == null) return null;
+      Node current = node;
+      while (current.Parent != null)
       {
-        var r = Split2(t);
-        return (r.left, r.right, u.right);
+        current = current.Parent;
+      }
+      return current;
+    }
+
+    /// <summary>
+    /// 2つのノードが同じSplay Tree（つまり同じ連結成分の表現）に属するかどうかを判断します。
+    /// </summary>
+    private bool AreNodesInSameTree(Node? node1, Node? node2)
+    {
+      if (node1 != null) Splay(node1);
+      if (node2 != null) Splay(node2);
+      return FindRoot(node1) == FindRoot(node2);
+    }
+
+    /// <summary>
+    /// 指定されたノードを、それが属するオイラーツアー表現の新しい開始点（根）にします。
+    /// </summary>
+    private Node? Reroot(Node node)
+    {
+      var (leftPart, rightPart) = Split(node);
+      return Merge(rightPart, leftPart);
+    }
+
+    /// <summary>
+    /// 指定されたノードでSplay Treeを分割します。ノード自身は分割後の右側の木の根になります。
+    /// </summary>
+    private (Node? left, Node? right) Split(Node nodeToSplitAt)
+    {
+      Splay(nodeToSplitAt);
+      Node? leftSubtree = nodeToSplitAt.Children[0];
+      if (leftSubtree != null) leftSubtree.Parent = null;
+      nodeToSplitAt.Children[0] = null;
+      return (leftSubtree, UpdateNode(nodeToSplitAt));
+    }
+
+    /// <summary>
+    /// 指定されたノードをSplay Treeから取り除き、元の左部分木と右部分木を返します。
+    /// 取り除かれたノードは単一ノードの木になります。
+    /// </summary>
+    private (Node? left, Node? right) SplitRemovingNode(Node nodeToRemove)
+    {
+      Splay(nodeToRemove);
+      Node? leftSubtree = nodeToRemove.Children[0];
+      Node? rightSubtree = nodeToRemove.Children[1];
+      if (leftSubtree != null) leftSubtree.Parent = null;
+      nodeToRemove.Children[0] = null;
+      if (rightSubtree != null) rightSubtree.Parent = null;
+      nodeToRemove.Children[1] = null;
+      UpdateNode(nodeToRemove);
+      return (leftSubtree, rightSubtree);
+    }
+
+    /// <summary>
+    /// 辺を表す2つのノード (edgeNode1, edgeNode2) を横断するパスを切断し、
+    /// 結果として生じる3つの部分木を返します。主に辺の削除処理で使用されます。
+    /// </summary>
+    private (Node? part1, Node? part2, Node? part3) SplitForEdgeRemoval(Node edgeNode1, Node edgeNode2)
+    {
+      var (originalLeftOfEdge1, originalRightOfEdge1) = SplitRemovingNode(edgeNode1);
+      if (AreNodesInSameTree(originalLeftOfEdge1, edgeNode2))
+      {
+        var (originalLeftOfEdge2, originalRightOfEdge2) = SplitRemovingNode(edgeNode2);
+        return (originalLeftOfEdge2, originalRightOfEdge2, originalRightOfEdge1);
       }
       else
       {
-        var r = Split2(t);
-        return (u.left, r.left, r.right);
+        var (originalLeftOfEdge2, originalRightOfEdge2) = SplitRemovingNode(edgeNode2);
+        return (originalLeftOfEdge1, originalLeftOfEdge2, originalRightOfEdge2);
       }
     }
 
     /// <summary>
-    /// 2つの木sとtを連結します。sの右端とtの左端を接続します。
+    /// 2つのSplay Tree (firstTree と secondTree) を連結します。
+    /// firstTreeの最も右の要素とsecondTreeの最も左の要素（根）を接続します。
     /// </summary>
-    private Node? Merge(Node? s, Node? t)
+    private Node? Merge(Node? firstTree, Node? secondTree)
     {
-      if (s == null) return t;
-      if (t == null) return s;
+      if (firstTree == null) return secondTree;
+      if (secondTree == null) return firstTree;
+      Node currentRightmost = firstTree;
+      while (currentRightmost.Children[1] != null)
+      {
+        currentRightmost = currentRightmost.Children[1];
+      }
+      Splay(currentRightmost);
 
-      while (s?.Ch[1] != null) s = s.Ch[1];
-      Splay(s!);
-
-      s!.Ch[1] = t;
-      if (t != null) t.P = s;
-      return Update(s);
+      currentRightmost.Children[1] = secondTree;
+      if (secondTree != null) secondTree.Parent = currentRightmost; // secondTreeがnullでないことを確認    
+      return UpdateNode(currentRightmost);
     }
 
     /// <summary>
-    /// 4つの木を順番に連結します。Linkメソッド内で使用されます。
+    /// 4つのSplay Treeを順番に連結します。主にLink操作で使用されます。
     /// </summary>
     private Node? Merge(Node? n1, Node? n2, Node? n3, Node? n4)
     {
@@ -285,442 +301,751 @@ public class DynamicConnectivity<T>
     }
 
     /// <summary>
-    /// 指定されたノードを根とする部分木のサイズを取得します。
+    /// 指定されたノードを根とする部分木のサイズ（頂点ノード数）を取得します。
     /// </summary>
-    private int GetSize(Node? t) => t?.Sz ?? 0;
+    private int GetSubtreeSize(Node? node) => node?.SubtreeSize ?? 0;
 
     /// <summary>
-    /// 指定されたノードの情報を（子の情報に基づいて）更新します。
+    /// 指定されたノードの集約値やサイズなどの情報を、その子ノードに基づいて更新します。
     /// </summary>
-    private Node Update(Node t)
+    private Node UpdateNode(Node node)
     {
-      t.Sum = _opETT.Identity;
-      if (t.Ch[0] != null) t.Sum = _opETT.Operate(t.Sum, t.Ch[0]!.Sum);
-      if (t.L == t.R) t.Sum = _opETT.Operate(t.Sum, t.Val);
-      if (t.Ch[1] != null) t.Sum = _opETT.Operate(t.Sum, t.Ch[1]!.Sum);
+      node.AggregatedValue = _monoidOpETT.Identity;
+      if (node.Children[0] is Node leftChild) node.AggregatedValue = _monoidOpETT.Operate(node.AggregatedValue, leftChild.AggregatedValue);
+      if (node.Endpoint1 == node.Endpoint2) node.AggregatedValue = _monoidOpETT.Operate(node.AggregatedValue, node.Value);
+      if (node.Children[1] is Node rightChild) node.AggregatedValue = _monoidOpETT.Operate(node.AggregatedValue, rightChild.AggregatedValue);
 
-      t.Sz = GetSize(t.Ch[0]) + ((t.L == t.R) ? 1 : 0) + GetSize(t.Ch[1]);
+      node.SubtreeSize = GetSubtreeSize(node.Children[0]) + ((node.Endpoint1 == node.Endpoint2) ? 1 : 0) + GetSubtreeSize(node.Children[1]);
 
-      t.ChildEdgeConnected = (t.Ch[0]?.ChildEdgeConnected ?? false) || t.EdgeConnected || (t.Ch[1]?.ChildEdgeConnected ?? false);
+      node.HasNonTreeEdgeConnectedChild = (node.Children[0]?.HasNonTreeEdgeConnectedChild ?? false) ||
+                                          node.IsNonTreeEdgeConnected ||
+                                          (node.Children[1]?.HasNonTreeEdgeConnectedChild ?? false);
 
-      t.ChildExact = (t.Ch[0]?.ChildExact ?? false) || t.Exact || (t.Ch[1]?.ChildExact ?? false);
-      return t;
+      node.HasExactEdgeInChildren = (node.Children[0]?.HasExactEdgeInChildren ?? false) ||
+                                     node.IsExactEdge ||
+                                     (node.Children[1]?.HasExactEdgeInChildren ?? false);
+      return node;
     }
 
     /// <summary>
-    /// 遅延評価された情報を子ノードに伝播します。（現在は未実装）
+    /// 遅延評価された情報を子ノードに伝播します。（現在は未実装のプレースホルダ）
     /// </summary>
-    private void Push(Node t)
+    private void PropagateLazy(Node node)
     {
-      // 将来遅延評価が必要な場合のためのプレースホルダ
+      // Placeholder
     }
 
     /// <summary>
     /// Splay Treeの回転操作を行います。
     /// </summary>
-    private void Rotate(Node t, bool isTLeftChildOfParent)
+    private void Rotate(Node node, bool isNodeLeftChildOfParent)
     {
-      Node x = t.P!;
-      Node? y = x.P;
+      Debug.Assert(node.Parent != null, "Parent must exist for Rotate.");
+      Node parentNode = node.Parent;
+      Node? grandparent = parentNode.Parent;
 
-      x.Ch[isTLeftChildOfParent ? 0 : 1] = t.Ch[isTLeftChildOfParent ? 1 : 0];
-      if (t.Ch[isTLeftChildOfParent ? 1 : 0] != null)
+      parentNode.Children[isNodeLeftChildOfParent ? 0 : 1] = node.Children[isNodeLeftChildOfParent ? 1 : 0];
+      if (node.Children[isNodeLeftChildOfParent ? 1 : 0] is Node childToRelink)
       {
-        t.Ch[isTLeftChildOfParent ? 1 : 0]!.P = x;
+        childToRelink.Parent = parentNode;
       }
 
-      t.Ch[isTLeftChildOfParent ? 1 : 0] = x;
-      x.P = t;
+      node.Children[isNodeLeftChildOfParent ? 1 : 0] = parentNode;
+      parentNode.Parent = node;
 
-      Update(x);
-      Update(t);
+      UpdateNode(parentNode);
+      UpdateNode(node);
 
-      t.P = y;
-      if (y != null)
+      node.Parent = grandparent;
+      if (grandparent != null)
       {
-        if (y.Ch[0] == x) y.Ch[0] = t;
-        else if (y.Ch[1] == x) y.Ch[1] = t;
+        if (grandparent.Children[0] == parentNode) grandparent.Children[0] = node;
+        else if (grandparent.Children[1] == parentNode) grandparent.Children[1] = node;
       }
     }
 
     /// <summary>
-    /// 指定されたノードを木の根に移動させるSplay操作。
+    /// 指定されたノードを、それが属するSplay Treeの根に移動させるSplay操作を行います。
     /// </summary>
-    private void Splay(Node t)
+    private void Splay(Node node)
     {
-      Push(t);
+      PropagateLazy(node);
 
-      while (!t.IsRoot())
+      while (!node.IsRoot())
       {
-        Node q = t.P!;
-        if (q.IsRoot())
+        Debug.Assert(node.Parent != null, "Node must have a parent in Splay loop.");
+        Node parent = node.Parent;
+        if (parent.IsRoot())
         {
-          Push(q); Push(t);
-          Rotate(t, t == q.Ch[0]);
+          PropagateLazy(parent); PropagateLazy(node);
+          Rotate(node, node == parent.Children[0]);
         }
         else
         {
-          Node r = q.P!;
-          Push(r); Push(q); Push(t);
-          bool qIsLeftChild = (q == r.Ch[0]);
-          bool tIsLeftChild = (t == q.Ch[0]);
+          Debug.Assert(parent.Parent != null, "Parent must have a parent if not root.");
+          Node grandparent = parent.Parent;
+          PropagateLazy(grandparent); PropagateLazy(parent); PropagateLazy(node);
+          bool parentIsLeftChild = (parent == grandparent.Children[0]);
+          bool nodeIsLeftChild = (node == parent.Children[0]);
 
-          if (qIsLeftChild == tIsLeftChild)
+          if (parentIsLeftChild == nodeIsLeftChild)
           {
-            Rotate(q, qIsLeftChild);
-            Rotate(t, tIsLeftChild);
+            Rotate(parent, parentIsLeftChild);
+            Rotate(node, nodeIsLeftChild);
           }
           else
           {
-            Rotate(t, tIsLeftChild);
-            Rotate(t, qIsLeftChild);
+            Rotate(node, nodeIsLeftChild);
+            Rotate(node, parentIsLeftChild);
           }
         }
       }
     }
 
     /// <summary>
-    /// デバッグ用に木構造（ノードのL-Rペア）を標準エラーストリームに出力します。
+    /// 指定された頂点IDが属する連結成分（ETT内の木）のサイズ（頂点数）を取得します。
     /// </summary>
-    public void DebugTree(Node? t)
+    /// <param name="vertexId">サイズを取得したい連結成分内の任意の頂点ID。</param>
+    /// <returns>連結成分のサイズ。</returns>
+    /// <remarks>計算量: 償却 $O(\log N)$。</remarks>
+    public int GetTreeSize(int vertexId)
     {
-      if (t == null) return;
-      DebugTree(t.Ch[0]);
-      System.Diagnostics.Debug.Write($"{t.L}-{t.R} ");
-      DebugTree(t.Ch[1]);
+      Node node = GetNode(vertexId, vertexId);
+      Splay(node);
+      return node.SubtreeSize;
     }
 
     /// <summary>
-    /// 指定された頂点sが属する連結成分のサイズを取得します。
+    /// 2つの頂点IDが同じ連結成分（ETT内の同じ木）に属するかどうかを判定します。
     /// </summary>
-    public int GetTreeSize(int s)
+    /// <param name="vertexId1">1つ目の頂点ID。</param>
+    /// <param name="vertexId2">2つ目の頂点ID。</param>
+    /// <returns>同じ連結成分に属していればtrue、そうでなければfalse。</returns>
+    /// <remarks>計算量: 償却 $O(\log N)$。</remarks>
+    public bool AreSame(int vertexId1, int vertexId2)
     {
-      Node t = GetNode(s, s);
-      Splay(t);
-      return t.Sz;
+      // GetNodeはSplayを行わないため、AreNodesInSameTree内でSplayされる
+      return AreNodesInSameTree(GetNode(vertexId1, vertexId1), GetNode(vertexId2, vertexId2));
     }
 
     /// <summary>
-    /// 2つの頂点が同じ連結成分に属するかどうかを判定します。
+    /// 指定された頂点IDに関連付けられた値を、指定された新しい値とモノイド演算で合成して更新します。
     /// </summary>
-    public bool AreSame(int s, int t)
+    /// <param name="vertexId">値を更新する頂点のID。</param>
+    /// <param name="value">現在の値と合成する新しい値。</param>
+    /// <remarks>計算量: 償却 $O(\log N)$。</remarks>
+    public void UpdateValue(int vertexId, T value)
     {
-      return Same(GetNode(s, s), GetNode(t, t));
+      Node targetNode = GetNode(vertexId, vertexId);
+      Splay(targetNode);
+      targetNode.Value = _monoidOpETT.Operate(targetNode.Value, value);
+      UpdateNode(targetNode);
     }
 
     /// <summary>
-    /// EulerTourTreeのサイズ（頂点数）を再設定し、内部構造を初期化します。
+    /// 指定された頂点IDを含む連結成分（ETT内の木）で、"IsExactEdge"がtrueの辺ノードを探索し、
+    /// 見つかった辺に対して指定されたアクションを実行します。主に代替路探索の準備で使われます。
     /// </summary>
-    public void SetSize(int newSize)
+    /// <param name="vertexId">探索を開始する連結成分内の任意の頂点ID。</param>
+    /// <param name="onExactEdgeFound">IsExactEdgeがtrueの辺 (e1, e2) が見つかったときに呼び出されるアクション。</param>
+    /// <remarks>
+    /// このメソッド自体が処理する辺の数に依存しますが、各辺の処理にはSplay ($O(\log N)$) が含まれます。
+    /// DynamicConnectivity全体の文脈では、このコストは償却されます。
+    /// </remarks>
+    public void ProcessExactEdgesInComponent(int vertexId, Action<int, int> onExactEdgeFound)
     {
-      _ptr = new List<Dictionary<int, Node>>(newSize);
-      for (int i = 0; i < newSize; i++)
+      Node componentRoot = GetNode(vertexId, vertexId);
+      Splay(componentRoot);
+
+      void DfsProcessExactEdges(Node currentNode)
       {
-        _ptr.Add(new Dictionary<int, Node>());
-        _ptr[i][i] = new Node(i, i, _opETT.Identity);
-      }
-    }
-
-    /// <summary>
-    /// 指定された頂点sに関連付けられた値をxで更新します（現在の値とxを集約）。
-    /// </summary>
-    public void UpdateValue(int s, T x)
-    {
-      Node t = GetNode(s, s);
-      Splay(t);
-      t.Val = _opETT.Operate(t.Val, x);
-      Update(t);
-    }
-
-    /// <summary>
-    /// 頂点sを含むコンポーネント内の「Exact」なエッジを処理し、アクションgに渡します。
-    /// </summary>
-    public void EdgeUpdate(int s, Action<int, int> g)
-    {
-      Node t = GetNode(s, s);
-      Splay(t);
-
-      Action<Node>? dfs = null;
-      dfs = (Node curr) =>
-      {
-        Debug.Assert(curr != null, "DFSの現在のノードがnullです。");
-        if (curr.L < curr.R && curr.Exact)
+        if (currentNode.Endpoint1 < currentNode.Endpoint2 && currentNode.IsExactEdge)
         {
-          Splay(curr);
-          curr.Exact = false;
-          Update(curr);
-          g(curr.L, curr.R);
+          Splay(currentNode);
+          currentNode.IsExactEdge = false;
+          UpdateNode(currentNode);
+          onExactEdgeFound(currentNode.Endpoint1, currentNode.Endpoint2);
+          return; // 1つ処理したら戻る（Splayで構造が変わるため）
+        }
+
+        Node? leftChild = currentNode.Children[0];
+        if (leftChild != null && leftChild.HasExactEdgeInChildren)
+        {
+          DfsProcessExactEdges(leftChild);
+          // Splayにより構造が変わった可能性があるので、再度componentRootから探索を始めるか、
+          // または、このDFSの呼び出し方自体を工夫する必要があるかもしれない。
+          // 元のC++コードでは、whileループでSplay(t)を繰り返していた。
+          // 安全のため、1つ処理したらループに戻るようにする。
           return;
         }
 
-        if (curr.Ch[0]?.ChildExact ?? false) dfs!(curr.Ch[0]!);
-        else if (curr.Ch[1]?.ChildExact ?? false) dfs!(curr.Ch[1]!);
-      };
+        Node? rightChild = currentNode.Children[1];
+        if (rightChild != null && rightChild.HasExactEdgeInChildren)
+        {
+          DfsProcessExactEdges(rightChild);
+          return;
+        }
+      }
 
-      while (t != null && t.ChildExact)
+      // HasExactEdgeInChildren がtrueの間、処理を試みる
+      while (componentRoot != null && componentRoot.HasExactEdgeInChildren)
       {
-        dfs(t);
-        Splay(t);
+        // componentRoot はSplayされているので、もし自身がExactEdgeなら処理される。
+        // そうでなければ、DfsProcessExactEdgesが子孫のExactEdgeを探して処理する。
+        // DfsProcessExactEdges内でSplayが起きるので、ループの先頭でcomponentRootを再Splayする。
+        Splay(componentRoot); // ループの各反復でcomponentRootをSplayしなおす
+        if (!componentRoot.HasExactEdgeInChildren) break; // Splay後に再度確認
+
+        // 以前のコード: DfsProcessExactEdges(componentRoot); Splay(componentRoot);
+        // DfsProcessExactEdgesが return で抜けた場合、Splay(componentRoot)で元の状態に戻る。
+        // ここでは、Dfsが1つ処理したらループを抜けるか、またはループを継続するなら
+        // componentRootの状態を常に最新に保つ必要がある。
+        // よりシンプルなのは、見つかったら処理してループを抜ける(または再度ループ条件を確認する)
+
+        // DfsProcessExactEdgesを呼び出す前にcomponentRootがsplayされている必要がある
+        // DfsProcessExactEdgesは最初に見つけたExact Edgeを処理し、その過程でSplayを行う。
+        // その後、ループが継続する場合、componentRootの状態を再度確認する。
+        bool processedThisIteration = false;
+        void DfsSingle(Node curr) // 1つだけ処理するDFS
+        {
+          if (processedThisIteration) return;
+          if (curr.Endpoint1 < curr.Endpoint2 && curr.IsExactEdge)
+          {
+            Splay(curr); curr.IsExactEdge = false; UpdateNode(curr);
+            onExactEdgeFound(curr.Endpoint1, curr.Endpoint2);
+            processedThisIteration = true; return;
+          }
+          if (curr.Children[0] is Node l && l.HasExactEdgeInChildren) DfsSingle(l);
+          if (processedThisIteration) return;
+          if (curr.Children[1] is Node r && r.HasExactEdgeInChildren) DfsSingle(r);
+        }
+        DfsSingle(componentRoot);
+
+        if (!processedThisIteration) break; // Exact Edgeが見つからなかったらループ終了
+
+        // componentRootが指すノードはSplayで変わっている可能性があるため、
+        // 常にvertexIdに対応するノードを再取得・Splayしてループを回すのが安全。
+        componentRoot = GetNode(vertexId, vertexId);
+        Splay(componentRoot);
       }
     }
 
     /// <summary>
-    /// 頂点sを含むコンポーネントで、条件fを満たす非ツリーエッジを探し、再接続を試みます。
+    /// 指定された頂点IDを含む連結成分（ETT内の木）で、非ツリーエッジに接続されている頂点 (IsNonTreeEdgeConnectedがtrue) を探し、
+    /// 見つかった頂点に対して指定されたアクションを実行し、アクションがtrueを返せば探索を終了します。
+    /// 主に代替路探索で使用されます。
     /// </summary>
-    public bool TryReconnect(int s, Func<int, bool> f)
+    /// <param name="vertexId">探索を開始する連結成分内の任意の頂点ID。</param>
+    /// <param name="findAction">IsNonTreeEdgeConnectedがtrueの頂点が見つかったときに呼び出される関数。
+    /// この関数がtrueを返すと、TryFindReplacementEdgeもtrueを返して終了します。</param>
+    /// <returns>findActionがtrueを返した場合にtrue、そうでなければfalse。</returns>
+    /// <remarks>
+    /// 計算量はfindActionの内容と、条件を満たす頂点の見つかり方に依存します。
+    /// DynamicConnectivity全体の文脈では、このコストは償却されます。
+    /// </remarks>
+    public bool TryFindReplacementEdge(int vertexId, Func<int, bool> findAction)
     {
-      Node t = GetNode(s, s);
-      Splay(t);
+      Node componentRoot = GetNode(vertexId, vertexId);
+      Splay(componentRoot);
 
-      Func<Node, bool>? dfs = null;
-      dfs = (Node curr) =>
+      bool DfsFindReplacement(Node currentNode)
       {
-        Debug.Assert(curr != null, "DFSの現在のノードがnullです。");
-        if (curr.EdgeConnected)
+        if (currentNode.IsNonTreeEdgeConnected)
         {
-          Splay(curr);
-          return f(curr.L);
+          Splay(currentNode);
+          if (findAction(currentNode.Endpoint1)) return true;
         }
 
-        if (curr.Ch[0]?.ChildEdgeConnected ?? false)
+        Node? leftChild = currentNode.Children[0];
+        if (leftChild != null && leftChild.HasNonTreeEdgeConnectedChild)
         {
-          if (dfs!(curr.Ch[0]!)) return true;
+          if (DfsFindReplacement(leftChild)) return true;
         }
-        if (curr.Ch[1]?.ChildEdgeConnected ?? false)
+
+        Node? rightChild = currentNode.Children[1];
+        if (rightChild != null && rightChild.HasNonTreeEdgeConnectedChild)
         {
-          if (dfs!(curr.Ch[1]!)) return true;
+          if (DfsFindReplacement(rightChild)) return true;
         }
         return false;
-      };
+      }
 
-      while (t.ChildEdgeConnected)
+      // HasNonTreeEdgeConnectedChildがtrueの間、試行する
+      // Dfs内でSplayが起きるため、ループの先頭でcomponentRootを再Splayする
+      while (componentRoot != null && componentRoot.HasNonTreeEdgeConnectedChild)
       {
-        if (dfs(t)) return true;
-        Splay(t);
+        Splay(componentRoot); // ループの各反復でcomponentRootをSplayしなおす
+        if (!componentRoot.HasNonTreeEdgeConnectedChild) break; // Splay後に再度確認
+
+        if (DfsFindReplacement(componentRoot)) return true;
+
+        // DfsFindReplacement が false を返したが、HasNonTreeEdgeConnectedChild はまだ true の場合、
+        // 処理されていないノードがある可能性がある。しかし、上記のDFSは全探索するはず。
+        // もし DfsFindReplacement が false を返したら、このループは終了すべき。
+        // (findAction が true を返さなかったため)
+        break;
       }
       return false;
     }
 
     /// <summary>
-    /// 指定された頂点sのEdgeConnectedフラグを更新します。
+    /// 指定された頂点IDのIsNonTreeEdgeConnectedフラグ（非ツリーエッジに接続されているか）を更新します。
     /// </summary>
-    public void EdgeConnectedUpdate(int s, bool b)
+    /// <param name="vertexId">フラグを更新する頂点のID。</param>
+    /// <param name="isConnected">新しいフラグの値。</param>
+    /// <remarks>計算量: 償却 $O(\log N)$。</remarks>
+    public void UpdateNonTreeEdgeConnection(int vertexId, bool isConnected)
     {
-      Node t = GetNode(s, s);
-      Splay(t);
-      t.EdgeConnected = b;
-      Update(t);
+      Node node = GetNode(vertexId, vertexId);
+      Splay(node);
+      node.IsNonTreeEdgeConnected = isConnected;
+      UpdateNode(node);
     }
 
     /// <summary>
-    /// 2つの頂点lとrの間に辺を接続します（ETTレベルでの操作）。
+    /// 2つの頂点間に辺を接続します（ETTレベルでのオイラーツアー操作）。
     /// </summary>
-    public bool Link(int l, int r)
+    /// <param name="endpoint1">辺の一方の端点ID。</param>
+    /// <param name="endpoint2">辺のもう一方の端点ID。</param>
+    /// <returns>接続に成功すればtrue、既に同じ連結成分に属していた場合はfalse。</returns>
+    /// <remarks>計算量: 償却 $O(\log N)$。</remarks>
+    public bool Link(int endpoint1, int endpoint2)
     {
-      if (AreSame(l, r)) return false;
-      Node nodeL = GetNode(l, l);
-      Node nodeR = GetNode(r, r);
-      Node edgeLR = GetNode(l, r);
-      Node edgeRL = GetNode(r, l);
+      if (AreSame(endpoint1, endpoint2)) return false;
+      Node node1 = GetNode(endpoint1, endpoint1);
+      Node node2 = GetNode(endpoint2, endpoint2);
+      Node edge12 = GetNode(endpoint1, endpoint2);
+      Node edge21 = GetNode(endpoint2, endpoint1);
 
-      Merge(Reroot(nodeL), edgeLR, Reroot(nodeR), edgeRL);
+      Merge(Reroot(node1), edge12, Reroot(node2), edge21);
       return true;
     }
 
     /// <summary>
-    /// 2つの頂点lとrの間の辺を切断します（ETTレベルでの操作）。
+    /// 2つの頂点間の辺を切断します（ETTレベルでのオイラーツアー操作）。
     /// </summary>
-    public bool Cut(int l, int r)
+    /// <param name="endpoint1">辺の一方の端点ID。</param>
+    /// <param name="endpoint2">辺のもう一方の端点ID。</param>
+    /// <returns>切断に成功すればtrue、辺が存在しなかった場合はfalse。</returns>
+    /// <remarks>計算量: 償却 $O(\log N)$。</remarks>
+    public bool Cut(int endpoint1, int endpoint2)
     {
-      if (!_ptr[l].ContainsKey(r) || !_ptr[r].ContainsKey(l)) return false;
+      if (endpoint1 < 0 || endpoint1 >= _vertexPairToNodeMap.Count ||
+          endpoint2 < 0 || endpoint2 >= _vertexPairToNodeMap.Count ||
+          !_vertexPairToNodeMap[endpoint1].ContainsKey(endpoint2) ||
+          !_vertexPairToNodeMap[endpoint2].ContainsKey(endpoint1))
+      {
+        return false;
+      }
 
-      Node edgeLR = GetNode(l, r);
-      Node edgeRL = GetNode(r, l);
+      Node edge12 = GetNode(endpoint1, endpoint2);
+      Node edge21 = GetNode(endpoint2, endpoint1);
 
-      var (s, tVal, u) = Split(edgeLR, edgeRL); // tVal is a temporary name, not used
-      Merge(s, u);
+      var (part1, _, part3) = SplitForEdgeRemoval(edge12, edge21);
+      Merge(part1, part3);
 
-      _ptr[l].Remove(r);
-      _ptr[r].Remove(l);
+      _vertexPairToNodeMap[endpoint1].Remove(endpoint2);
+      _vertexPairToNodeMap[endpoint2].Remove(endpoint1);
 
       return true;
     }
 
     /// <summary>
-    /// 指定された頂点vを含む連結成分の、頂点pから見た部分木の合計値を取得します。
+    /// 特定の辺(cutEndpoint1, sumEndpoint)を一時的に切断し、sumEndpoint側の連結成分の集約値を取得します。
+    /// その後、辺を再接続します。
     /// </summary>
-    public T GetPathSum(int p, int v)
+    /// <param name="cutEndpoint1">一時的に切断する辺の端点1。</param>
+    /// <param name="sumEndpoint">集約値を取得する側の連結成分に含まれる辺の端点2。</param>
+    /// <returns>sumEndpointが含まれる（切断後の）連結成分の集約値。</returns>
+    /// <remarks>計算量: 償却 $O(\log N)$。</remarks>
+    public T GetSumAcrossCut(int cutEndpoint1, int sumEndpoint)
     {
-      bool cutSuccess = false;
-      if (_ptr.Count > p && _ptr[p].ContainsKey(v) &&
-          _ptr.Count > v && _ptr[v].ContainsKey(p))
+      bool cutPerformed = false;
+      if (cutEndpoint1 >= 0 && cutEndpoint1 < _vertexPairToNodeMap.Count &&
+          sumEndpoint >= 0 && sumEndpoint < _vertexPairToNodeMap.Count &&
+          _vertexPairToNodeMap[cutEndpoint1].ContainsKey(sumEndpoint) &&
+          _vertexPairToNodeMap[sumEndpoint].ContainsKey(cutEndpoint1))
       {
-        cutSuccess = Cut(p, v);
+        cutPerformed = Cut(cutEndpoint1, sumEndpoint);
       }
 
-      Node tNode = GetNode(v, v);
-      Splay(tNode);
-      T res = tNode.Sum;
+      Node sumNode = GetNode(sumEndpoint, sumEndpoint);
+      Splay(sumNode);
+      T result = sumNode.AggregatedValue;
 
-      if (cutSuccess)
+      if (cutPerformed)
       {
-        Link(p, v);
+        Link(cutEndpoint1, sumEndpoint);
       }
 
-      return res;
+      return result;
     }
 
     /// <summary>
-    /// 指定された頂点sが属する連結成分の合計値を取得します。
+    /// 指定された頂点IDが属する連結成分全体の集約値を取得します。
     /// </summary>
-    public T GetComponentSum(int s)
+    /// <param name="vertexId">集約値を取得したい連結成分内の任意の頂点ID。</param>
+    /// <returns>連結成分全体の集約値。</returns>
+    /// <remarks>計算量: 償却 $O(\log N)$。</remarks>
+    public T GetComponentSum(int vertexId)
     {
-      Node t = GetNode(s, s);
-      Splay(t);
-      return t.Sum;
+      Node node = GetNode(vertexId, vertexId);
+      Splay(node);
+      return node.AggregatedValue;
+    }
+
+    /// <summary>
+    /// 指定された頂点IDに対応するノードの持つ固有の値 (Value) を取得します。
+    /// </summary>
+    /// <param name="vertexId">値を取得したい頂点のID。</param>
+    /// <returns>頂点sのValue。</returns>
+    /// <remarks>計算量: 償却 $O(\log N)$。</remarks>
+    public T GetSpecificNodeValue(int vertexId)
+    {
+      Node node = GetNode(vertexId, vertexId);
+      Splay(node);
+      return node.Value;
+    }
+
+    /// <summary>
+    /// 指定された頂点IDが属する連結成分（このETTが表す木）に含まれる全ての頂点のIDリストを取得します。
+    /// </summary>
+    /// <param name="vertexIdInComponent">情報を取得したい連結成分内の任意の頂点ID。</param>
+    /// <returns>連結成分内の全頂点IDのリスト。指定されたvertexIdが無効な場合は空のリストを返すことがあります。</returns>
+    /// <remarks>計算量: 成分の頂点数を $V_c$、グラフ全体の頂点数を $N$ とすると、償却 $O(V_c + \log N)$。
+    /// (初期のSplay操作に $O(\log N)$、成分内のノード走査に $O(V_c)$）。
+    /// </remarks>
+    public List<int> GetVerticesInComponent(int vertexIdInComponent)
+    {
+      // 基本的な範囲チェック (GetNodeがより詳細なチェックを行う)
+      if (vertexIdInComponent < 0 || vertexIdInComponent >= _vertexPairToNodeMap.Count)
+      {
+        return new List<int>();
+      }
+
+      Node componentRepresentativeNode = GetNode(vertexIdInComponent, vertexIdInComponent);
+      Splay(componentRepresentativeNode); // 連結成分に対応するETTの根をSplay
+
+      var collectedVertices = new List<int>();
+      CollectVertexNodesRecursive(componentRepresentativeNode, collectedVertices);
+
+      // 必要であればソートする (現在はSplay Treeのin-order順に近い順序になる)
+      // collectedVertices.Sort(); 
+      return collectedVertices;
+    }
+
+    /// <summary>
+    /// 指定されたノードを根とするSplay Treeを再帰的に辿り、頂点ノードを収集します。
+    /// </summary>
+    private void CollectVertexNodesRecursive(Node? currentNode, List<int> collectedVertices)
+    {
+      if (currentNode == null)
+      {
+        return;
+      }
+
+      // 中間順巡回 (In-order traversal) でノードを訪問
+      CollectVertexNodesRecursive(currentNode.Children[0], collectedVertices);
+
+      if (currentNode.Endpoint1 == currentNode.Endpoint2) // 頂点ノード (例: (v,v)) かどうか
+      {
+        // 通常、ETTの構造とSplay Treeの走査により、各頂点ノードは一度だけ現れるはず。
+        // 重複を厳密に避けたい場合は、Listの代わりにHashSetを内部的に使うこともできる。
+        collectedVertices.Add(currentNode.Endpoint1);
+      }
+
+      CollectVertexNodesRecursive(currentNode.Children[1], collectedVertices);
+    }
+
+    /// <summary>
+    /// 指定された頂点IDに対応するノードの持つ固有の値 (Value) を、指定された新しい値で直接置き換えます。
+    /// 更新後、このノードを含むSplay Treeのルートまでの集約値が再計算されます。
+    /// </summary>
+    /// <param name="vertexId">値を設定する頂点のID。</param>
+    /// <param name="newValue">設定する新しい値。</param>
+    /// <remarks>計算量: 償却 $O(\log N)$。</remarks>
+    public void SetSpecificNodeValue(int vertexId, T newValue)
+    {
+      // GetNodeは、(vertexId, vertexId)が頂点vertexId自身を表すノードを取得します。
+      // 範囲外のvertexIdに対するエラー処理はGetNode内に含まれるか、
+      // 呼び出し元のDynamicConnectivityクラスで事前に行われます。
+      Node targetNode = GetNode(vertexId, vertexId);
+      Splay(targetNode);         // ノードを根に移動
+      targetNode.Value = newValue; // 値を直接置き換え
+      UpdateNode(targetNode);    // 集約値 (AggregatedValue) などを再計算
     }
   } // EulerTourTreeクラス終わり
+
 
   /// <summary>
   /// DynamicConnectivityの新しいインスタンスを初期化します。
   /// </summary>
-  /// <param name="sz">グラフの頂点数。</param>
+  /// <param name="vertexCount">グラフの頂点数。</param>
   /// <param name="monoidOperator">頂点の値に対するモノイド演算を定義したオペレータ。</param>
-  public DynamicConnectivity(int sz, IMonoidOperator<T> monoidOperator)
+  /// <remarks>計算量: $O(N)$、ここで $N$ は頂点数。</remarks>
+  public DynamicConnectivity(int vertexCount, IMonoidOperator<T> monoidOperator)
   {
-    _sz = sz;
-    _operator = monoidOperator;
+    if (vertexCount < 0) throw new ArgumentOutOfRangeException(nameof(vertexCount), "Number of vertices cannot be negative.");
+    _vertexCount = vertexCount;
+    _monoidOperator = monoidOperator ?? throw new ArgumentNullException(nameof(monoidOperator));
 
-    _ett = new List<EulerTourTree>();
-    _ett.Add(new EulerTourTree(_sz, _operator));
-
-    _edges = new List<List<HashSet<int>>>();
-    var initialLevelEdges = new List<HashSet<int>>(_sz);
-    for (int i = 0; i < _sz; i++)
+    _eulerTourTrees = new List<EulerTourTree>();
+    if (_vertexCount > 0)
     {
-      initialLevelEdges.Add(new HashSet<int>());
+      _eulerTourTrees.Add(new EulerTourTree(_vertexCount, _monoidOperator));
     }
-    _edges.Add(initialLevelEdges);
+
+    _nonTreeEdgesByLevel = new List<List<HashSet<int>>>();
+    if (_vertexCount > 0)
+    {
+      var initialLevelEdges = new List<HashSet<int>>(_vertexCount);
+      for (int i = 0; i < _vertexCount; i++)
+      {
+        initialLevelEdges.Add(new HashSet<int>());
+      }
+      _nonTreeEdgesByLevel.Add(initialLevelEdges);
+    }
   }
 
   /// <summary>
-  /// 頂点sと頂点tの間に辺を追加します。
+  /// 指定された頂点番号が有効な範囲内にあるかを確認します。
   /// </summary>
-  public bool Link(int s, int t)
-  {
-    if (s == t) return false;
-    if (_ett[0].Link(s, t)) return true;
+  private bool IsValidVertex(int vertexId) => vertexId >= 0 && vertexId < _vertexCount;
 
-    _edges[0][s].Add(t);
-    _edges[0][t].Add(s);
-    if (_edges[0][s].Count == 1) _ett[0].EdgeConnectedUpdate(s, true);
-    if (_edges[0][t].Count == 1) _ett[0].EdgeConnectedUpdate(t, true);
+  /// <summary>
+  /// 2つの頂点間に辺を追加します。
+  /// もし2頂点が既に連結している場合、この辺は非ツリーエッジとして扱われます。
+  /// </summary>
+  /// <param name="sourceVertexId">辺の始点となる頂点のID。</param>
+  /// <param name="targetVertexId">辺の終点となる頂点のID。</param>
+  /// <returns>辺が新たに追加され、グラフの連結性が変化した場合はtrue。
+  /// 既に連結していた、または自身へのループなどで辺が実質的に追加されなかった場合はfalse。</returns>
+  /// <remarks>計算量: 償却 $O(\log N)$。</remarks>
+  public bool Link(int sourceVertexId, int targetVertexId)
+  {
+    if (!IsValidVertex(sourceVertexId) || !IsValidVertex(targetVertexId)) return false;
+    if (sourceVertexId == targetVertexId) return false;
+    if (_vertexCount == 0) return false; // ETTが存在しない
+
+    if (_eulerTourTrees[0].Link(sourceVertexId, targetVertexId)) return true;
+
+    _nonTreeEdgesByLevel[0][sourceVertexId].Add(targetVertexId);
+    _nonTreeEdgesByLevel[0][targetVertexId].Add(sourceVertexId);
+    // Count == 1 は、その頂点にとってこれが最初の非ツリーエッジであることを意味する
+    if (_nonTreeEdgesByLevel[0][sourceVertexId].Count == 1) _eulerTourTrees[0].UpdateNonTreeEdgeConnection(sourceVertexId, true);
+    if (_nonTreeEdgesByLevel[0][targetVertexId].Count == 1) _eulerTourTrees[0].UpdateNonTreeEdgeConnection(targetVertexId, true);
     return false;
   }
 
   /// <summary>
-  /// 2つの頂点sとtが同じ連結成分に属しているかどうかを判定します。
+  /// 2つの頂点が同じ連結成分に属しているかどうかを判定します。
   /// </summary>
-  public bool SameComponent(int s, int t)
+  /// <param name="vertexId1">1つ目の頂点ID。</param>
+  /// <param name="vertexId2">2つ目の頂点ID。</param>
+  /// <returns>同じ連結成分に属していればtrue、そうでなければfalse。</returns>
+  /// <remarks>計算量: 償却 $O(\log N)$。</remarks>
+  public bool SameComponent(int vertexId1, int vertexId2)
   {
-    return _ett[0].AreSame(s, t);
+    if (!IsValidVertex(vertexId1) || !IsValidVertex(vertexId2)) return false;
+    if (vertexId1 == vertexId2) return true;
+    if (_vertexCount == 0) return false;
+    return _eulerTourTrees[0].AreSame(vertexId1, vertexId2);
   }
 
   /// <summary>
-  /// 指定された頂点sが属する連結成分のサイズを取得します。
+  /// 指定された頂点が属する連結成分のサイズ（頂点数）を取得します。
   /// </summary>
-  public int ComponentSize(int s)
+  /// <param name="vertexId">サイズを調べる連結成分内の任意の頂点ID。</param>
+  /// <returns>連結成分のサイズ。頂点が存在しない場合は0。</returns>
+  /// <remarks>計算量: 償却 $O(\log N)$。</remarks>
+  public int ComponentSize(int vertexId)
   {
-    return _ett[0].GetTreeSize(s);
+    if (!IsValidVertex(vertexId)) return 0;
+    if (_vertexCount == 0) return 0;
+    return _eulerTourTrees[0].GetTreeSize(vertexId);
   }
 
   /// <summary>
-  /// 指定された頂点sに関連付けられた値をxで更新します（現在の値とxを集約）。
+  /// 指定された番号の頂点に設定されている値を、指定された新しい値で直接置き換えます。
+  /// これはモノイド演算による合成ではなく、単純な上書きです。
+  /// 関連する連結成分の集約値も適切に更新されます。
   /// </summary>
-  public void UpdateValue(int s, T x)
+  /// <param name="vertexId">値を設定する頂点の番号。</param>
+  /// <param name="newValue">設定する新しい値。</param>
+  /// <exception cref="ArgumentOutOfRangeException">指定されたvertexIdが無効な場合。</exception>
+  /// <exception cref="InvalidOperationException">グラフの頂点数が0の場合。</exception>
+  /// <remarks>計算量: 償却 $O(\log N)$。</remarks>
+  public void SetValue(int vertexId, T newValue)
   {
-    _ett[0].UpdateValue(s, x);
-  }
-
-  /// <summary>
-  /// 指定された頂点sが属する連結成分の合計値を取得します。
-  /// </summary>
-  public T GetSum(int s)
-  {
-    return _ett[0].GetComponentSum(s);
-  }
-
-  /// <summary>
-  /// 頂点sと頂点tの間の辺を削除します。
-  /// </summary>
-  public bool Cut(int s, int t)
-  {
-    if (s == t) return false;
-
-    for (int i = 0; i < _dep; i++)
+    if (!IsValidVertex(vertexId))
     {
-      bool sRemoved = _edges[i][s].Remove(t);
-      bool tRemoved = _edges[i][t].Remove(s);
-      // Removeが成功した場合のみEdgeConnectedUpdateを評価
-      if (sRemoved && _edges[i][s].Count == 0) _ett[i].EdgeConnectedUpdate(s, false);
-      if (tRemoved && _edges[i][t].Count == 0) _ett[i].EdgeConnectedUpdate(t, false);
+      throw new ArgumentOutOfRangeException(nameof(vertexId), "Specified vertex ID is out of valid range.");
+    }
+    if (_vertexCount == 0) // 頂点が一つもない場合
+    {
+      // このケースは IsValidVertex で vertexId < 0 となるため通常は到達しないが、
+      // _vertexCount が 0 の場合に _eulerTourTrees[0] にアクセスするのを防ぐ意味で重要。
+      throw new InvalidOperationException("Cannot set value in a graph with zero vertices.");
     }
 
-    for (int i = _dep - 1; i >= 0; i--)
+    // レベル0のEulerTourTreeの値を設定
+    _eulerTourTrees[0].SetSpecificNodeValue(vertexId, newValue);
+  }
+
+  /// <summary>
+  /// 指定された頂点に関連付けられた値を、指定された新しい値とモノイド演算で合成して更新します。
+  /// </summary>
+  /// <param name="vertexId">値を更新する頂点のID。</param>
+  /// <param name="value">現在の値と合成する新しい値。</param>
+  /// <remarks>計算量: 償却 $O(\log N)$。</remarks>
+  public void UpdateValue(int vertexId, T value)
+  {
+    if (!IsValidVertex(vertexId)) return;
+    if (_vertexCount == 0) return;
+    _eulerTourTrees[0].UpdateValue(vertexId, value);
+  }
+
+  /// <summary>
+  /// 指定された番号の頂点に直接設定されている値 (Value) を取得します。
+  /// これは連結成分全体の集約値ではなく、その頂点固有の値です。
+  /// </summary>
+  /// <param name="vertexId">値を取得したい頂点の番号。</param>
+  /// <returns>頂点sのValue。頂点が存在しないか無効な場合はオペレータの単位元を返します。</returns>
+  /// <remarks>計算量: 償却 $O(\log N)$。</remarks>
+  public T Get(int vertexId)
+  {
+    if (!IsValidVertex(vertexId))
     {
-      if (_ett[i].Cut(s, t))
+      return _monoidOperator.Identity;
+    }
+    if (_vertexCount == 0)
+    {
+      return _monoidOperator.Identity;
+    }
+    return _eulerTourTrees[0].GetSpecificNodeValue(vertexId);
+  }
+
+  /// <summary>
+  /// 指定された頂点が属する連結成分全体の集約値を取得します。
+  /// </summary>
+  /// <param name="vertexId">集約値を取得したい連結成分内の任意の頂点ID。</param>
+  /// <returns>連結成分全体の集約値。頂点が存在しない場合はオペレータの単位元。</returns>
+  /// <remarks>計算量: 償却 $O(\log N)$。</remarks>
+  public T GetSum(int vertexId)
+  {
+    if (!IsValidVertex(vertexId)) return _monoidOperator.Identity;
+    if (_vertexCount == 0) return _monoidOperator.Identity;
+    return _eulerTourTrees[0].GetComponentSum(vertexId);
+  }
+
+  /// <summary>
+  /// 2つの頂点間の辺を削除します。
+  /// もしこの辺が橋であり、代替路が見つからなければ、連結成分が分割されます。
+  /// </summary>
+  /// <param name="vertexId1">辺の一方の端点ID。</param>
+  /// <param name="vertexId2">辺のもう一方の端点ID。</param>
+  /// <returns>辺の削除によりグラフの連結性が実際に断たれた（代替路が見つからなかった）場合はtrue。
+  /// 辺が非ツリーエッジだった、代替路が見つかった、または辺が存在しなかった場合はfalse。</returns>
+  /// <remarks>計算量: 償却 $O(\log^2 N)$。</remarks>
+  public bool Cut(int vertexId1, int vertexId2)
+  {
+    if (!IsValidVertex(vertexId1) || !IsValidVertex(vertexId2)) return false;
+    if (vertexId1 == vertexId2) return false;
+    if (_vertexCount == 0) return false;
+
+    for (int level = 0; level < _levelCount; level++)
+    {
+      bool sRemoved = _nonTreeEdgesByLevel[level][vertexId1].Remove(vertexId2);
+      bool tRemoved = _nonTreeEdgesByLevel[level][vertexId2].Remove(vertexId1);
+      if (sRemoved && _nonTreeEdgesByLevel[level][vertexId1].Count == 0) _eulerTourTrees[level].UpdateNonTreeEdgeConnection(vertexId1, false);
+      if (tRemoved && _nonTreeEdgesByLevel[level][vertexId2].Count == 0) _eulerTourTrees[level].UpdateNonTreeEdgeConnection(vertexId2, false);
+    }
+
+    for (int level = _levelCount - 1; level >= 0; level--)
+    {
+      if (_eulerTourTrees[level].Cut(vertexId1, vertexId2))
       {
-        if (_dep - 1 == i)
+        if (_levelCount - 1 == level)
         {
-          _dep++;
-          _ett.Add(new EulerTourTree(_sz, _operator)); // _operator を使用
-          var newLevelEdges = new List<HashSet<int>>(_sz);
-          for (int j = 0; j < _sz; j++) newLevelEdges.Add(new HashSet<int>());
-          _edges.Add(newLevelEdges);
+          _levelCount++;
+          if (_vertexCount > 0) _eulerTourTrees.Add(new EulerTourTree(_vertexCount, _monoidOperator));
+          else _eulerTourTrees.Add(new EulerTourTree(0, _monoidOperator)); // vertexCountが0の場合も考慮
+
+          var newLevelEdges = new List<HashSet<int>>(_vertexCount); // _vertexCountが0なら空のリスト
+          for (int j = 0; j < _vertexCount; j++) newLevelEdges.Add(new HashSet<int>());
+          _nonTreeEdgesByLevel.Add(newLevelEdges);
         }
-        return !TryReconnect(s, t, i);
+        return !TryReconnect(vertexId1, vertexId2, level);
       }
     }
     return false;
   }
 
   /// <summary>
-  /// レベルkで辺(s,t)が切断された後、レベルk以下のグラフで代替路を探します。
+  /// レベルlevelCutOccurredで辺(vertexId1, vertexId2)が切断された後、
+  /// レベルlevelCutOccurred以下のグラフで代替路を探します。
   /// </summary>
-  private bool TryReconnect(int s, int t, int k)
+  private bool TryReconnect(int vertexId1, int vertexId2, int levelCutOccurred)
   {
-    for (int i = k; i >= 0; i--)
+    int u = vertexId1;
+    int v = vertexId2;
+
+    for (int currentLevel = levelCutOccurred; currentLevel >= 0; currentLevel--)
     {
-      if (_ett[i].GetTreeSize(s) > _ett[i].GetTreeSize(t)) Swap(ref s, ref t);
+      // _eulerTourTrees[currentLevel] が存在することを確認 (Cutで新しいレベルが追加された直後など)
+      if (currentLevel >= _eulerTourTrees.Count) continue;
 
-      Action<int, int> g = (u, v) => _ett[i + 1].Link(u, v);
-      _ett[i].EdgeUpdate(s, g);
+      if (_eulerTourTrees[currentLevel].GetTreeSize(u) > _eulerTourTrees[currentLevel].GetTreeSize(v)) Swap(ref u, ref v);
 
-      Func<int, bool> f = (int x) =>
+      // currentLevel + 1 が範囲内であることを確認
+      if (currentLevel + 1 >= _eulerTourTrees.Count)
       {
-        foreach (var y_loop_var in new List<int>(_edges[i][x]))
+        // このケースは、最上位レベルのさらに上に昇格させようとする場合に発生しうる。
+        // Cutで新しいレベルは事前に作成されるはずなので、通常はここに来ないか、
+        // もし来た場合は新しいレベルをその場で作る必要があるが、Cut内のロジックで対応済みのはず。
+        // ここで例外を投げるか、安全にスキップする。
+        // Debug.Fail("Trying to access ETT level out of bounds during promoteEdgeAction setup.");
+        // continue; // または、適切なエラー処理
+      }
+
+      Action<int, int> promoteEdgeAction = (edgeSource, edgeTarget) =>
+      {
+        if (currentLevel + 1 < _eulerTourTrees.Count)
         {
-          var y = y_loop_var;
-          if (!_edges[i][x].Contains(y)) continue;
+          _eulerTourTrees[currentLevel + 1].Link(edgeSource, edgeTarget);
+        }
+        // currentLevel + 1 が範囲外の場合の処理は、Cutでレベルが追加されるので通常発生しない想定
+      };
+      _eulerTourTrees[currentLevel].ProcessExactEdgesInComponent(u, promoteEdgeAction);
 
-          _edges[i][x].Remove(y);
-          _edges[i][y].Remove(x);
+      Func<int, bool> findReplacementAction = (vertexToSearchFrom) =>
+      {
+        var neighbors = new List<int>(_nonTreeEdgesByLevel[currentLevel][vertexToSearchFrom]);
+        foreach (var neighbor in neighbors)
+        {
+          if (!_nonTreeEdgesByLevel[currentLevel][vertexToSearchFrom].Contains(neighbor)) continue;
 
-          if (_edges[i][x].Count == 0) _ett[i].EdgeConnectedUpdate(x, false);
-          if (_edges[i][y].Count == 0) _ett[i].EdgeConnectedUpdate(y, false);
+          _nonTreeEdgesByLevel[currentLevel][vertexToSearchFrom].Remove(neighbor);
+          _nonTreeEdgesByLevel[currentLevel][neighbor].Remove(vertexToSearchFrom);
 
-          if (_ett[i].AreSame(x, y))
+          if (_nonTreeEdgesByLevel[currentLevel][vertexToSearchFrom].Count == 0) _eulerTourTrees[currentLevel].UpdateNonTreeEdgeConnection(vertexToSearchFrom, false);
+          if (_nonTreeEdgesByLevel[currentLevel][neighbor].Count == 0) _eulerTourTrees[currentLevel].UpdateNonTreeEdgeConnection(neighbor, false);
+
+          if (_eulerTourTrees[currentLevel].AreSame(vertexToSearchFrom, neighbor))
           {
-            _edges[i + 1][x].Add(y);
-            _edges[i + 1][y].Add(x);
-            if (_edges[i + 1][x].Count == 1) _ett[i + 1].EdgeConnectedUpdate(x, true);
-            if (_edges[i + 1][y].Count == 1) _ett[i + 1].EdgeConnectedUpdate(y, true);
+            if (currentLevel + 1 < _nonTreeEdgesByLevel.Count) // 次のレベルが存在するか確認
+            {
+              _nonTreeEdgesByLevel[currentLevel + 1][vertexToSearchFrom].Add(neighbor);
+              _nonTreeEdgesByLevel[currentLevel + 1][neighbor].Add(vertexToSearchFrom);
+              if (_nonTreeEdgesByLevel[currentLevel + 1][vertexToSearchFrom].Count == 1) _eulerTourTrees[currentLevel + 1].UpdateNonTreeEdgeConnection(vertexToSearchFrom, true);
+              if (_nonTreeEdgesByLevel[currentLevel + 1][neighbor].Count == 1) _eulerTourTrees[currentLevel + 1].UpdateNonTreeEdgeConnection(neighbor, true);
+            }
           }
           else
           {
-            for (int j = 0; j <= i; j++)
+            for (int linkLevel = 0; linkLevel <= currentLevel; linkLevel++)
             {
-              _ett[j].Link(x, y);
+              _eulerTourTrees[linkLevel].Link(vertexToSearchFrom, neighbor);
             }
             return true;
           }
@@ -728,7 +1053,7 @@ public class DynamicConnectivity<T>
         return false;
       };
 
-      if (_ett[i].TryReconnect(s, f)) return true;
+      if (_eulerTourTrees[currentLevel].TryFindReplacementEdge(u, findReplacementAction)) return true;
     }
     return false;
   }
@@ -739,6 +1064,31 @@ public class DynamicConnectivity<T>
   private void Swap<TItem>(ref TItem a, ref TItem b)
   {
     (a, b) = (b, a);
+  }
+
+  /// <summary>
+  /// 指定された頂点が属する連結成分に含まれる全ての頂点のIDリストを取得します。
+  /// </summary>
+  /// <param name="vertexId">連結成分を特定するための頂点ID。</param>
+  /// <returns>
+  /// 指定された頂点が属する連結成分の全頂点IDのリスト。
+  /// 指定された頂点IDが無効な場合や、グラフが空の場合は空のリストを返します。
+  /// </returns>
+  /// <remarks>
+  /// 計算量: 成分の頂点数を $V_c$、グラフ全体の頂点数を $N$ とすると、償却 $O(V_c + \log N)$。
+  /// </remarks>
+  public List<int> GetVertices(int vertexId)
+  {
+    if (!IsValidVertex(vertexId))
+    {
+      return new List<int>();
+    }
+    if (_vertexCount == 0) // 頂点が一つもない場合
+    {
+      return new List<int>();
+    }
+    // レベル0のEulerTourTreeから頂点リストを取得
+    return _eulerTourTrees[0].GetVerticesInComponent(vertexId);
   }
 }
 
@@ -813,7 +1163,13 @@ public struct CMY
 
   public static CMY operator *(CMY cmy, double scalar) => scalar * cmy;
 
-  public static CMY operator /(CMY cmy, double scalar) => new CMY(cmy.C / scalar, cmy.M / scalar, cmy.Y / scalar);
+  public static CMY operator /(CMY cmy, double scalar)
+  {
+    if (Math.Abs(scalar) < 1e-9) return new CMY(0, 0, 0);
+    return new CMY(cmy.C / scalar, cmy.M / scalar, cmy.Y / scalar);
+  }
+
+  public static double MaxDistance => Math.Sqrt(3);
 
   public static (double All, double C, double M, double Y) Distance(CMY cmy1, CMY cmy2)
   {
@@ -848,8 +1204,8 @@ public class Cell
   public Cell(CMY color, double volume, int capacity)
   {
     Color = color;
+    Volume = Math.Max(volume, 0);
     Capacity = Math.Max(capacity, 0);
-    Volume = Math.Min(Math.Max(volume, 0), Capacity);
   }
 
   public override bool Equals(object? obj) => obj is Cell cell
@@ -867,10 +1223,16 @@ public class Cell
   {
     int newCapacity = c1.Capacity + c2.Capacity;
     double newVolume = c1.Volume + c2.Volume;
-    double c = (c1.Volume * c1.Color.C + c2.Volume * c2.Color.C) / newVolume;
-    double m = (c1.Volume * c1.Color.M + c2.Volume * c2.Color.M) / newVolume;
-    double y = (c1.Volume * c1.Color.Y + c2.Volume * c2.Color.Y) / newVolume;
-    CMY newColor = new CMY(c, m, y);
+
+    CMY newColor = new CMY(0, 0, 0);
+    if (newVolume > 1e-9)
+    {
+      double c = (c1.Volume * c1.Color.C + c2.Volume * c2.Color.C) / newVolume;
+      double m = (c1.Volume * c1.Color.M + c2.Volume * c2.Color.M) / newVolume;
+      double y = (c1.Volume * c1.Color.Y + c2.Volume * c2.Color.Y) / newVolume;
+      newColor = new CMY(c, m, y);
+    }
+
     return new Cell(newColor, newVolume, newCapacity);
   }
 
@@ -898,17 +1260,253 @@ public class CellSumOperator : IMonoidOperator<Cell>
   public Cell Operate(Cell c1, Cell c2) => c1 + c2;
 }
 
+public class Palette
+{
+  public static readonly int Size;
+  // public static readonly int Kinds;
+  // public static readonly int Targets;
+  public static readonly int MaxTurns;
+  public static readonly int Cost;
+
+  static Palette()
+  {
+    Size = N;
+    // Kinds = K;
+    // Targets = H;
+    MaxTurns = T;
+    Cost = D;
+  }
+
+  // private Cell[,] _cells;
+
+  private DynamicConnectivity<Cell> _dc;
+
+  private int[,] _verticalDividers;
+
+  private int[,] _horizontalDividers;
+
+  private List<(int[] Log, int VisualizedScore, double EvaluatedScore)> _logs;
+
+  private List<(CMY Color, double Deviation)> _madePaints;
+
+  public int OpCount { get; private set; }
+
+  public int AddCount { get; private set; }
+
+  public (double Definite, double Tentative) Deviation { get; private set; }
+
+  public int TargetId { get; private set; }
+
+  public int VisualizedScore => (int)(1 + Cost * (AddCount - _madePaints.Count) + Math.Round(1e4 * Deviation.Definite));
+
+  public double EvaluatedScore => 1 + Cost * Math.Max(AddCount - Targets.Count, 0) + Math.Round(1e4 * Deviation.Tentative);
+
+  public Palette()
+  {
+    // _cells = new Cell[Size, Size];
+    // for (int i = 0; i < Size; i++)
+    // {
+    //   for (int j = 0; j < Size; j++)
+    //   {
+    //     _cells[i, j] = new Cell(new CMY(0, 0, 0), 0, 1);
+    //   }
+    // }
+
+    _dc = new(Size * Size, new CellSumOperator());
+    for (int cy = 0; cy < Size; cy++)
+    {
+      for (int cx = 0; cx < Size; cx++)
+      {
+        int f1 = cy * Size + cx;
+        _dc.SetValue(f1, new Cell(new CMY(0, 0, 0), 0, 1));
+
+        for (int i = 0; i < DY.Length; i++)
+        {
+          int ey = cy + DY[i];
+          int ex = cx + DX[i];
+          if (ey < 0 || ey >= Size || ex < 0 || ex >= Size) continue;
+          int f2 = ey * Size + ex;
+          _dc.Link(f1, f2);
+        }
+      }
+    }
+
+    _verticalDividers = new int[Size, Size - 1];
+    _horizontalDividers = new int[Size - 1, Size];
+    for (int i = 0; i < Size; i++)
+    {
+      for (int j = 0; j < Size - 1; j++)
+      {
+        _verticalDividers[i, j] = 1;
+        _horizontalDividers[j, i] = 1;
+      }
+    }
+    _verticalDividers[0, 0] = 0;
+
+    _logs = new();
+    _madePaints = new();
+
+    OpCount = 0;
+    AddCount = 0;
+    Deviation = (0, CMY.MaxDistance * Targets.Count);
+    TargetId = 0;
+  }
+
+  public Cell this[int y, int x]
+  {
+    get
+    {
+      if (y < 0 || y >= Size || x < 0 || x >= Size) throw new ArgumentOutOfRangeException();
+      // return _cells[y, x];
+      return _dc.Get(y * Size + x);
+    }
+    private set
+    {
+      if (y < 0 || y >= Size || x < 0 || x >= Size) throw new ArgumentOutOfRangeException();
+      // _cells[y, x] = value;
+      _dc.SetValue(y * Size + x, value);
+    }
+  }
+
+  // ターン数が残っていて操作可能な状態かどうか判定する
+  public bool IsOperatable() => OpCount <= MaxTurns;
+
+  // ゲームの終了条件を満たしているか確認する
+  public bool IsSubmittable() => TargetId >= Targets.Count;
+
+  // 引数で渡されたリストの内容に応じて操作を行い1ターン進める
+  public void Operate(int[] args)
+  {
+    int type = args[0];
+    switch (type)
+    {
+      case 1:
+        Add(new Coord(args[1], args[2]), args[3]);
+        break;
+      case 2:
+        Give(new Coord(args[1], args[2]));
+        break;
+      case 3:
+        Discard(new Coord(args[1], args[2]), false);
+        break;
+      case 4:
+        SwitchDivider(new Coord(args[1], args[2]), new Coord(args[3], args[4]));
+        break;
+      default:
+        throw new ArgumentException();
+    }
+
+    _logs.Add((args, VisualizedScore, EvaluatedScore));
+    OpCount++;
+  }
+
+  // 操作1に対応するメソッド
+  private void Add(Coord coord, int tubeId)
+  {
+    // 引数で指定したセルが属するウェルを取得
+    int cid = coord.Y * Size + coord.X;
+    var well = _dc.GetSum(cid);
+
+    // 追加する絵の具の情報を最大容量0のセルで表現
+    var tmpCell = new Cell(Tubes[tubeId], Math.Max(Math.Min(well.Capacity - well.Volume, 1), 0), 0);
+
+    // ウェルに合成してから各セルに再分配する
+    well += tmpCell;
+    foreach (int vid in _dc.GetVertices(cid))
+    {
+      _dc.SetValue(vid, well / _dc.ComponentSize(cid));
+    }
+
+    AddCount++;
+  }
+
+  // 操作2に対応するメソッド
+  private void Give(Coord coord)
+  {
+    var cell = Discard(coord, true);
+    double d = CMY.Distance(cell.Color, Targets[TargetId]).All;
+    _madePaints.Add((cell.Color, d));
+    Deviation = (Deviation.Definite + d, Deviation.Tentative - (CMY.MaxDistance - d));
+
+    TargetId++;
+  }
+
+  // 操作3に対応するメソッド
+  private Cell Discard(Coord coord, bool strict)
+  {
+    // 引数で指定したセルが属するウェルを取得
+    int cid = coord.Y * Size + coord.X;
+    var well = _dc.GetSum(cid);
+
+    // strictが有効で絵の具の量が1gに満たない場合は例外
+    if (well.Volume < 1 - 1e-6)
+    {
+      throw new InvalidOperationException("選択したウェルの絵の具の量が1g未満です。");
+    }
+
+    // 取り出す絵の具の情報を最大容量0のセルで表現
+    double takenAmount = Math.Max(Math.Min(well.Capacity - well.Volume, 1), 0);
+    var taken = new Cell(well.Color, takenAmount, 0);
+
+    // 取り出す分だけ絵の具をウェルから廃棄し各セルに再分配する
+    well = new Cell(well.Color, well.Volume - takenAmount, well.Capacity);
+    foreach (int vid in _dc.GetVertices(cid))
+    {
+      _dc.SetValue(vid, well / _dc.ComponentSize(cid));
+    }
+
+    return taken;
+  }
+
+  // 操作4に対応するメソッド
+  private void SwitchDivider(Coord c1, Coord c2)
+  {
+    throw new NotImplementedException();
+  }
+
+  public void Print(bool verbose = false)
+  {
+    // 仕切りの初期状態を出力
+    for (int i = 0; i < Size; i++)
+    {
+      for (int j = 0; j < Size - 1; j++)
+      {
+        Write($"{_verticalDividers[i, j]} ");
+      }
+      WriteLine();
+    }
+    for (int i = 0; i < Size - 1; i++)
+    {
+      for (int j = 0; j < Size; j++)
+      {
+        Write($"{_horizontalDividers[i, j]} ");
+      }
+      WriteLine();
+    }
+
+    // ログを出力
+    foreach ((int[] log, int v, double e) in _logs)
+    {
+      WriteLine(string.Join(' ', log));
+      if (verbose) Error.WriteLine($"Visualized: {v}, Evaluated: {e}");
+    }
+  }
+}
+
 public static class Program
 {
-  private static long Timeout => 2950;
+  public static readonly int[] DY = new int[] { -1, 0, 1, 0 };
+  public static readonly int[] DX = new int[] { 0, 1, 0, -1 };
 
-  private static int _n;
-  private static int _k;
-  private static int _h;
-  private static int _t;
-  private static int _d;
+  public static int N { get; private set; }
+  public static int K { get; private set; }
+  public static int H { get; private set; }
+  public static int T { get; private set; }
+  public static int D { get; private set; }
   private static CMY[] _tubes;
   private static CMY[] _targets;
+  public static ReadOnlyCollection<CMY> Tubes;
+  public static ReadOnlyCollection<CMY> Targets;
 
   public static void Main(string[] args)
   {
@@ -920,54 +1518,37 @@ public static class Program
   public static void Input()
   {
     int[] buf = ReadLine().Split().Select(int.Parse).ToArray();
-    (_n, _k, _h, _t, _d) = (buf[0], buf[1], buf[2], buf[3], buf[4]);
+    (N, K, H, T, D) = (buf[0], buf[1], buf[2], buf[3], buf[4]);
 
     Double[] buf2;
-    _tubes = new CMY[_k];
-    for (int i = 0; i < _k; i++)
+    _tubes = new CMY[K];
+    for (int i = 0; i < K; i++)
     {
       buf2 = ReadLine().Split().Select(double.Parse).ToArray();
       _tubes[i] = new CMY(buf2[0], buf2[1], buf2[2]);
     }
 
-    _targets = new CMY[_h];
-    for (int i = 0; i < _h; i++)
+    _targets = new CMY[H];
+    for (int i = 0; i < H; i++)
     {
       buf2 = ReadLine().Split().Select(double.Parse).ToArray();
       _targets[i] = new CMY(buf2[0], buf2[1], buf2[2]);
     }
+
+    Tubes = new(_tubes);
+    Targets = new(_targets);
   }
 
   public static void Greedy()
   {
-    // マス(i, j)とマス(i, j + 1)の間の縦の仕切りの初期状態を設定
-    for (int i = 0; i < _n; i++)
-    {
-      for (int j = 0; j < _n - 1; j++)
-      {
-        // Write($"{(j % 2 != 0 ? 1 : 0)} ");
-        Write($"0 ");
-      }
-      WriteLine();
-    }
+    var plt = new Palette();
 
-    // マス(i, j)とマス(i + 1, j)の間の横の仕切りの初期状態を設定
-    for (int i = 0; i < _n - 1; i++)
-    {
-      for (int j = 0; j < _n; j++)
-      {
-        // Write("1 ");
-        Write("0 ");
-      }
-      WriteLine();
-    }
-
-    for (int i = 0; i < _h; i++)
+    for (int i = 0; i < H; i++)
     {
       (double Diff, HashSet<int> Indexes) best = (double.MaxValue, new());
-      for (int t1 = 0; t1 < _k; t1++)
+      for (int t1 = 0; t1 < K; t1++)
       {
-        for (int t2 = 0; t2 < _k; t2++)
+        for (int t2 = 0; t2 < K; t2++)
         {
           var tmpCell1 = new Cell(_tubes[t1], 1, 1);
           var tmpCell2 = new Cell(_tubes[t2], 1, 1);
@@ -977,25 +1558,27 @@ public static class Program
           if (diff < best.Diff)
           {
             HashSet<int> indexes = new() { t1, t2 };
-            Error.WriteLine($"update: {best.Diff}({string.Join(',', best.Indexes)}) -> {diff}({string.Join(',', indexes)})");
+            // Error.WriteLine($"update: {best.Diff}({string.Join(',', best.Indexes)}) -> {diff}({string.Join(',', indexes)})");
             best = (diff, indexes);
           }
         }
       }
 
-      Error.WriteLine($"best: {best.Diff}({string.Join(',', best.Indexes)})");
+      // Error.WriteLine($"best: {best.Diff}({string.Join(',', best.Indexes)})");
       foreach (int idx in best.Indexes)
       {
-        WriteLine($"1 0 0 {idx}");
+        plt.Operate(new int[] { 1, 0, 0, idx });
       }
 
       // 調合した絵の具を画伯に差し出す
       // 1gより多くの絵の具をウェルに出した場合は勿体無いが廃棄する
       for (int j = 0; j < best.Indexes.Count; j++)
       {
-        if (j == 0) WriteLine("2 0 0");
-        else WriteLine("3 0 0");
+        if (j == 0) plt.Operate(new int[] { 2, 0, 0 });
+        else plt.Operate(new int[] { 3, 0, 0 });
       }
     }
+
+    plt.Print(Environment.GetEnvironmentVariable("ATCODER") != "1");
   }
 }
