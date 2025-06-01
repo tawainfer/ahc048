@@ -1581,8 +1581,7 @@ public static class Program
     var rand = new Random();
 
     // 1回のランダムな探索にかけられる実行時間
-    // int maxMixingMicroSec = 1000;
-    int maxRandomMicroSec = 0;
+    int maxRandomMicroSec = 500;
 
     var plt = new Palette();
     for (int i = 0; i < H; i++)
@@ -1599,19 +1598,21 @@ public static class Program
       );
 
       // 最初の数手は貪欲に最適なパターンを見つける
-      (CMY Color, double Delta, List<int> Tubes) firstBest = (new CMY(-1, -1, -1), double.MaxValue, new());
-      int greedyCnt = Math.Min(maxMixingCount, (int)Math.Log(1e4, Tubes.Count));
+      int greedyCount = Math.Min(maxMixingCount, (int)Math.Log(1e4, Tubes.Count));
+      var firstBests = new (CMY Color, double Delta, List<int> Tubes)[greedyCount + 1];
+      for (int j = 0; j < firstBests.Length; j++) firstBests[j] = (new CMY(-1, -1, -1), double.MaxValue, new());
       [MethodImpl(256)] void Dfs(List<int> ptn, int kinds, int size)
       {
-        if (ptn.Count >= size)
+        if (ptn.Count >= 1)
         {
           CMY color = ptn.Select((id) => Tubes[id]).Sum() / ptn.Count;
-          double delta = CMY.Distance(color, Targets[plt.TargetId]).All;
-          if (delta < firstBest.Delta)
+          double delta = plt.GetScoreDeltaByAddition(ptn.Count, color);
+          if (delta < firstBests[ptn.Count].Delta)
           {
-            firstBest = (color, delta, ptn);
+            firstBests[ptn.Count] = (color, delta, ptn);
           }
-          return;
+
+          if (ptn.Count >= size) return;
         }
 
         for (int i = 0; i < kinds; i++)
@@ -1621,113 +1622,90 @@ public static class Program
           Dfs(newPtn, kinds, size);
         }
       }
-      Dfs(new(), Tubes.Count, greedyCnt);
+      Dfs(new(), Tubes.Count, greedyCount);
 
-      (CMY Color, double Delta, List<int> Tubes) best = (firstBest.Color, firstBest.Delta, new(firstBest.Tubes));
+      (CMY Color, double Delta, List<int> Tubes) best = (firstBests[0].Color, firstBests[0].Delta, new(firstBests[0].Tubes));
       long st = TimeKeeper.ElapsedMicrosec();
 
       int searchCount = 0;
       while (TimeKeeper.ElapsedMicrosec() - st < maxRandomMicroSec)
       {
+        searchCount++;
         // 毎回パターンを作り直す
         // List<int> selectedTubes = new();
-        // CMY? currentColor = null;
 
         // 最初の数手を固定してパターンを作っていく
-        List<int> selectedTubes = new(firstBest.Tubes);
-        CMY? currentColor = firstBest.Color;
+        List<int> selectedTubes = new(firstBests[Math.Min(searchCount, greedyCount)].Tubes);
 
         // 現時点でベストな調合手順をコピーしてシャッフルし、半分を捨ててパターンを作り直す
         // List<int> selectedTubes = new(best.Tubes);
         // selectedTubes.Shuffle();
         // int discardCount = (selectedTubes.Count + 1) / 2;
         // for (int _ = 0; _ < discardCount; _++) selectedTubes.RemoveAt(selectedTubes.Count - 1);
-        // CMY? currentColor = (selectedTubes.Count >= 1
-        //   ? selectedTubes.Select((id) => Tubes[id]).Sum() / selectedTubes.Count
-        //   : null
-        // );
+
+        CMY? currentColor = (selectedTubes.Count >= 1
+          ? selectedTubes.Select((id) => Tubes[id]).Sum() / selectedTubes.Count
+          : null
+        );
 
         // for (int cnt = 1; cnt <= maxMixingCount; cnt++)
-        while (selectedTubes.Count < maxMixingCount && TimeKeeper.ElapsedMicrosec() - st < maxRandomMicroSec)
+        bool skip = true;
+        do
         {
-          searchCount++;
-
-          int tubeId = rand.Next(0, Tubes.Count);
-          CMY selectedColor = Tubes[tubeId];
-          if (currentColor is null) currentColor = selectedColor;
-          else currentColor = (currentColor + selectedColor) / 2;
-          selectedTubes.Add(tubeId);
-
-          // 選択した色のリストを同じ要素を持つ2つのリストに分けられる場合は操作回数を半分に削る
-          if (selectedTubes.Count % 2 == 0)
+          if (skip)
           {
-            List<int> t0 = new(selectedTubes);
-            t0.Sort();
-            List<int> t1 = new();
-            List<int> t2 = new();
-            while (t0.Count >= 1)
-            {
-              int x = t0.Last();
-              t0.RemoveAt(t0.Count - 1);
-              if (t1.Count <= t2.Count) t1.Add(x);
-              else t2.Add(x);
-            }
+            skip = false;
+          }
+          else
+          {
+            int tubeId = rand.Next(0, Tubes.Count);
+            CMY selectedColor = Tubes[tubeId];
+            if (currentColor is null) currentColor = selectedColor;
+            else currentColor = (currentColor + selectedColor) / 2;
+            selectedTubes.Add(tubeId);
 
-            bool check = true;
-            for (int j = 0; j < t1.Count; j++)
+            // 選択した色のリストを同じ要素を持つ2つのリストに分けられる場合は操作回数を半分に削る
+            if (selectedTubes.Count % 2 == 0)
             {
-              if (t1[j] != t2[j])
+              List<int> t0 = new(selectedTubes);
+              t0.Sort();
+              List<int> t1 = new();
+              List<int> t2 = new();
+              while (t0.Count >= 1)
               {
-                check = false;
-                break;
+                int x = t0.Last();
+                t0.RemoveAt(t0.Count - 1);
+                if (t1.Count <= t2.Count) t1.Add(x);
+                else t2.Add(x);
               }
-            }
 
-            if (check)
-            {
-              // Error.WriteLine($"cut! {string.Join(',', selectedTubes)} -> {string.Join(',', t1)}");
-              selectedTubes = t1;
-              currentColor = t1.Select((id) => Tubes[id]).Sum() / t1.Count;
+              bool check = true;
+              for (int j = 0; j < t1.Count; j++)
+              {
+                if (t1[j] != t2[j])
+                {
+                  check = false;
+                  break;
+                }
+              }
+
+              if (check)
+              {
+                // Error.WriteLine($"cut! {string.Join(',', selectedTubes)} -> {string.Join(',', t1)}");
+                selectedTubes = t1;
+                currentColor = t1.Select((id) => Tubes[id]).Sum() / t1.Count;
+              }
             }
           }
 
           double delta = plt.GetScoreDeltaByAddition(selectedTubes.Count, (CMY)currentColor);
           if (delta < best.Delta)
           {
-            Error.WriteLine($"searchCount: {searchCount} ({TimeKeeper.ElapsedMicrosec() - st}/{maxRandomMicroSec})μs");
-            Error.WriteLine($"{best.Delta}({string.Join(',', best.Tubes)}) -> {delta}({string.Join(',', selectedTubes)})");
+            Error.WriteLine($"update: {best.Delta}({string.Join(',', best.Tubes)}) -> {delta}({string.Join(',', selectedTubes)})");
             best = ((CMY)currentColor, delta, new(selectedTubes));
           }
-        }
-
-        // if (currentBest.Delta < best.Delta)
-        // {
-        //   // Error.WriteLine($"update: {best.Delta}({string.Join(',', best.Indexes)}) -> {currentBest.Delta}({string.Join(',', currentBest.Tubes)})");
-        //   best = currentBest;
-        // }
+        } while (selectedTubes.Count < maxMixingCount && TimeKeeper.ElapsedMicrosec() - st < maxRandomMicroSec);
       }
-      // Error.WriteLine($"targetId: {i}, maxMixingCount: {maxMixingCount}, searchCount: {searchCount}");
-      // Error.WriteLine($"best.Tubes: {string.Join(',', best.Tubes)}");
-
-      // for (int t1 = 0; t1 < K; t1++)
-      // {
-      //   for (int t2 = 0; t2 < K; t2++)
-      //   {
-      //     var tmpCell1 = new Cell(_tubes[t1], 1, 1);
-      //     var tmpCell2 = new Cell(_tubes[t2], 1, 1);
-      //     var mixedCell = (tmpCell1 + tmpCell2) / 2;
-      //     double diff = CMY.Distance(mixedCell.Color, _targets[i]).All;
-
-      //     if (diff < best.Delta)
-      //     {
-      //       HashSet<int> indexes = new() { t1, t2 };
-      //       // Error.WriteLine($"update: {best.Diff}({string.Join(',', best.Indexes)}) -> {diff}({string.Join(',', indexes)})");
-      //       best = (diff, indexes);
-      //     }
-      //   }
-      // }
-
-      // Error.WriteLine($"best: {best.Diff}({string.Join(',', best.Indexes)})");
 
       foreach (int tubeId in best.Tubes)
       {
