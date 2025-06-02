@@ -8,6 +8,7 @@ using System.Collections.ObjectModel;
 using System.Security;
 using System.Globalization;
 using System.Data.Common;
+using Microsoft.VisualBasic;
 
 public static class Extensions
 {
@@ -1280,6 +1281,282 @@ public class CellSumOperator : IMonoidOperator<Cell>
   public Cell Operate(Cell c1, Cell c2) => c1 + c2;
 }
 
+public class Grid
+{
+  private static readonly int[] _dy = { -1, 0, 1, 0 };
+  private static readonly int[] _dx = { 0, 1, 0, -1 };
+  private static int _nextgroupId = 1;
+
+  private Cell[,] _cells;
+
+  private int[,] _groupId;
+
+  private Dictionary<int, HashSet<Coord>> _groupList;
+
+  private bool[,] _verticalDividers;
+
+  private bool[,] _horizontalDividers;
+
+  private bool[,] _savedVerticalDividers;
+
+  private bool[,] _savedHorizontalDividers;
+
+  public int Width => _groupId.GetLength(1);
+  public int Height => _groupId.GetLength(0);
+
+  public Grid(int size, bool allDividersUp = false) : this(size, size, allDividersUp) { }
+
+  public Grid(int height, int width, bool allDividersUp = false)
+  {
+    _cells = new Cell[height, width];
+    for (int i = 0; i < height; i++)
+    {
+      for (int j = 0; j < width; j++)
+      {
+        _cells[i, j] = new Cell(new CMY(0, 0, 0), 0, 1);
+      }
+    }
+
+    _groupId = new int[height, width];
+    _groupList = new();
+
+    _verticalDividers = new bool[height, width - 1];
+    _horizontalDividers = new bool[height - 1, width];
+
+    if (allDividersUp)
+    {
+      for (int i = 0; i < height; i++)
+      {
+        for (int j = 0; j < width - 1; j++)
+        {
+          _verticalDividers[i, j] = true;
+        }
+      }
+      for (int i = 0; i < height - 1; i++)
+      {
+        for (int j = 0; j < width; j++)
+        {
+          _horizontalDividers[i, j] = true;
+        }
+      }
+
+      UpdateConnectivity(new List<Coord>());
+    }
+    else
+    {
+      UpdateConnectivity(new List<Coord>() { new Coord(0, 0) });
+    }
+
+    SaveDividers();
+  }
+
+  // public T this[int y, int x]
+  // {
+  //   get => _cells[y, x];
+  //   set => _cells[y, x] = value;
+  // }
+
+  // セルの情報を取得する
+  public Cell GetCell(Coord coord)
+  {
+    var cell = _cells[coord.Y, coord.X];
+    return new(cell.Color, cell.Volume, cell.Capacity);
+  }
+
+  // ウェルに関する情報(ウェルに含まれるセルを集約した情報)を取得する
+  public Cell GetWell(int wellId)
+  {
+    return GetWell(_groupList[wellId].First());
+  }
+
+  public Cell GetWell(Coord coord)
+  {
+    var cell = _cells[coord.Y, coord.X];
+    var group = _groupList[_groupId[coord.Y, coord.X]];
+    return new(cell.Color, cell.Volume * group.Count, cell.Capacity * group.Count);
+  }
+
+  // 指定したセル(が属するウェル)に絵の具を追加する
+  public void Add(Coord coord, CMY color, double grams = 1)
+  {
+    var group = _groupList[_groupId[coord.Y, coord.X]];
+    var startCell = _cells[coord.Y, coord.X];
+
+    var add = new Cell(
+      color,
+      Math.Min(grams / group.Count, (double)startCell.Capacity - startCell.Volume),
+      0
+    );
+
+    foreach (Coord c in group)
+    {
+      _cells[c.Y, c.X] += add;
+    }
+  }
+
+  // 指定したセル(が属するウェル)に溜まっている絵の具を廃棄する
+  public void Discard(Coord coord, bool strict, double grams = 1)
+  {
+    var group = _groupList[_groupId[coord.Y, coord.X]];
+    Cell startCell = _cells[coord.Y, coord.X];
+    Cell well = GetWell(coord);
+
+    // strictが有効で取り出し量が不足している場合は例外
+    if (strict && well.Volume < grams - 1e-6)
+    {
+      throw new InvalidOperationException("選択したウェルから取り出せる絵の具の量の上限を超えています");
+    }
+
+    foreach (Coord c in group)
+    {
+      _cells[c.Y, c.X] = new Cell(
+        _cells[c.Y, c.X].Color,
+        _cells[c.Y, c.X].Volume - grams / group.Count,
+        _cells[c.Y, c.X].Capacity);
+    }
+  }
+
+  // 基準となるセルから見て縦方向なら右側、横方向なら下側の仕切りが上がっているか確認する
+  public bool IsDividerUp(Coord coord, bool isVertical)
+  {
+    return isVertical
+      ? _verticalDividers[coord.Y, coord.X]
+      : _horizontalDividers[coord.Y, coord.X];
+  }
+
+  // 基準となるセルから見て縦方向なら右側、横方向なら下側の仕切りの状態を変更する
+  public void SwitchDivider(Coord coord, bool isVertical)
+  {
+    if (isVertical)
+    {
+      _verticalDividers[coord.Y, coord.X] ^= true;
+      UpdateConnectivity(new Coord[] { coord, new Coord(coord.Y, coord.X + 1) });
+    }
+    else
+    {
+      _horizontalDividers[coord.Y, coord.X] ^= true;
+      UpdateConnectivity(new Coord[] { coord, new Coord(coord.Y + 1, coord.X) });
+    }
+  }
+
+  // 引数で指定したリストの要素を順に取り出し、それを始点としてBFSを行い連結状態を更新していく
+  private void UpdateConnectivity(IList<Coord> startPoints)
+  {
+    // 空のリストが渡された場合は全てのセルを始点として設定する
+    if (startPoints.Count == 0)
+    {
+      for (int i = 0; i < Height; i++)
+      {
+        for (int j = 0; j < Width; j++)
+        {
+          startPoints.Add(new Coord(i, j));
+        }
+      }
+    }
+
+    // 一つずつ始点を決めて、BFSで始点と連結なマスを探していく
+    HashSet<Coord> visited = new();
+    HashSet<int> releasedGroupIds = new();
+    foreach (Coord sp in startPoints)
+    {
+      // 始点が現在属しているグループのIDをメモしておく
+      if (!releasedGroupIds.Contains(_groupId[sp.Y, sp.X]))
+      {
+        releasedGroupIds.Add(_groupId[sp.Y, sp.X]);
+      }
+
+      // 探索済みなら始点を選び直す
+      if (visited.Contains(sp)) continue;
+      visited.Add(sp);
+
+      // BFSで連結なマスを探索していき1つのグループの情報を完成させる
+      Queue<Coord> q = new();
+      q.Enqueue(sp);
+      while (q.Count >= 1)
+      {
+        Coord cp = q.Dequeue();
+        _groupId[cp.Y, cp.X] = _nextgroupId;
+        if (!_groupList.ContainsKey(_nextgroupId)) _groupList[_nextgroupId] = new();
+        _groupList[_nextgroupId].Add(cp);
+
+        for (int i = 0; i < _dy.Length; i++)
+        {
+          Coord ep = new(cp.Y + _dy[i], cp.X + _dx[i]);
+          if (ep.Y < 0 || ep.Y >= Height || ep.X < 0 || ep.X >= Width) continue;
+          if (i == 0 && IsDividerUp(ep, false)) continue;
+          if (i == 1 && IsDividerUp(cp, true)) continue;
+          if (i == 2 && IsDividerUp(cp, false)) continue;
+          if (i == 3 && IsDividerUp(ep, true)) continue;
+          if (visited.Contains(ep)) continue;
+          visited.Add(ep);
+          q.Enqueue(ep);
+        }
+      }
+
+      // BFSが終わった時点で1つのグループの情報が確定するので次に付与するグループIDをずらす
+      _nextgroupId++;
+    }
+
+    // 使われなくなったグループのリストを削除する(メモリ解放)
+    // foreach (int id in releasedGroupIds)
+    // {
+    //   _groupList.Remove(id);
+    // }
+  }
+
+  // 現在の仕切りの状態をセーブする
+  public void SaveDividers()
+  {
+    _savedVerticalDividers = new bool[_verticalDividers.GetLength(0), _verticalDividers.GetLength(1)];
+    for (int i = 0; i < _verticalDividers.GetLength(0); i++)
+    {
+      for (int j = 0; j < _verticalDividers.GetLength(1); j++)
+      {
+        _savedVerticalDividers[i, j] = _verticalDividers[i, j];
+      }
+    }
+    _savedHorizontalDividers = new bool[_horizontalDividers.GetLength(0), _horizontalDividers.GetLength(1)];
+    for (int i = 0; i < _horizontalDividers.GetLength(0); i++)
+    {
+      for (int j = 0; j < _horizontalDividers.GetLength(1); j++)
+      {
+        _savedHorizontalDividers[i, j] = _horizontalDividers[i, j];
+      }
+    }
+  }
+
+  // セーブされた仕切りの状態を出力する
+  public void PrintSavedDividers()
+  {
+    PrintDividers(_savedVerticalDividers, _savedHorizontalDividers);
+  }
+
+  // 現在の仕切りの状態を出力する
+  public void PrintCurrentDividers()
+  {
+    PrintDividers(_verticalDividers, _horizontalDividers);
+  }
+
+  [MethodImpl(256)]
+  private void PrintDividers(in bool[,] vertical, in bool[,] horizontal)
+  {
+    for (int i = 0; i < vertical.GetLength(0); i++)
+    {
+      for (int j = 0; j < vertical.GetLength(1); j++)
+      {
+        Write($"{(vertical[i, j] ? 1 : 0)} ");
+      }
+    }
+    for (int i = 0; i < horizontal.GetLength(0); i++)
+    {
+      for (int j = 0; j < horizontal.GetLength(1); j++)
+      {
+        Write($"{(horizontal[i, j] ? 1 : 0)} ");
+      }
+    }
+  }
+}
+
 public class Palette
 {
   public static readonly int Size;
@@ -1299,11 +1576,13 @@ public class Palette
 
   // private Cell[,] _cells;
 
-  private DynamicConnectivity<Cell> _dc;
+  // private DynamicConnectivity<Cell> _dc;
 
-  private int[,] _verticalDividers;
+  // private int[,] _verticalDividers;
 
-  private int[,] _horizontalDividers;
+  // private int[,] _horizontalDividers;
+
+  private Grid _grid;
 
   private List<(int[] Log, int VisualizedScore, double EvaluatedScore)> _logs;
 
@@ -1332,46 +1611,49 @@ public class Palette
     //   }
     // }
 
-    _dc = new(Size * Size, new CellSumOperator());
-    for (int cy = 0; cy < Size; cy++)
-    {
-      for (int cx = 0; cx < Size; cx++)
-      {
-        int f1 = cy * Size + cx;
-        _dc.SetValue(f1, new Cell(new CMY(0, 0, 0), 0, 1));
+    // _dc = new(Size * Size, new CellSumOperator());
+    // for (int cy = 0; cy < Size; cy++)
+    // {
+    //   for (int cx = 0; cx < Size; cx++)
+    //   {
+    //     int f1 = cy * Size + cx;
+    //     _dc.SetValue(f1, new Cell(new CMY(0, 0, 0), 0, 1));
 
-        for (int i = 0; i < DY.Length; i++)
-        {
-          int ey = cy + DY[i];
-          int ex = cx + DX[i];
-          if (ey < 0 || ey >= Size || ex < 0 || ex >= Size) continue;
-          if ((cy == 1 && i == 2) || (cy == 2 && i == 0)) continue; // tmp
-          int f2 = ey * Size + ex;
-          _dc.Link(f1, f2);
-        }
-      }
-    }
+    //     for (int i = 0; i < DY.Length; i++)
+    //     {
+    //       int ey = cy + DY[i];
+    //       int ex = cx + DX[i];
+    //       if (ey < 0 || ey >= Size || ex < 0 || ex >= Size) continue;
+    //       if ((cy == 1 && i == 2) || (cy == 2 && i == 0)) continue; // tmp
+    //       int f2 = ey * Size + ex;
+    //       _dc.Link(f1, f2);
+    //     }
+    //   }
+    // }
 
-    _verticalDividers = new int[Size, Size - 1];
-    _horizontalDividers = new int[Size - 1, Size];
-    for (int i = 0; i < Size; i++)
-    {
-      for (int j = 0; j < Size - 1; j++)
-      {
-        _verticalDividers[i, j] = 0;
-        _horizontalDividers[j, i] = 0;
-      }
-    }
-    for (int i = 0; i < Size; i++)
-    {
-      _horizontalDividers[1, i] = 1; // tmp
-    }
+    // _verticalDividers = new int[Size, Size - 1];
+    // _horizontalDividers = new int[Size - 1, Size];
+    // for (int i = 0; i < Size; i++)
+    // {
+    //   for (int j = 0; j < Size - 1; j++)
+    //   {
+    //     _verticalDividers[i, j] = 0;
+    //     _horizontalDividers[j, i] = 0;
+    //   }
+    // }
+    // for (int i = 0; i < Size; i++)
+    // {
+    //   _horizontalDividers[1, i] = 1; // tmp
+    // }
 
     // Error.WriteLine($"(0,0)の属するウェルのセル数 {_dc.GetVertices(0).Count}個");
     // Error.WriteLine($"(1,0)の属するウェルのセル数 {_dc.GetVertices(Size).Count}個");
     // Error.WriteLine($"(2,0)の属するウェルのセル数 {_dc.GetVertices(Size * 2).Count}個");
     // Error.WriteLine($"(3,0)の属するウェルのセル数 {_dc.GetVertices(Size * 3).Count}個");
     // Error.WriteLine($"(4,0)の属するウェルのセル数 {_dc.GetVertices(Size * 4).Count}個");
+
+    _grid = new Grid(Size, false); // 全ての仕切りをしまった状態でスタート
+    // _grid = new Grid(Size, true); // 全ての仕切りを出した状態でスタート
 
     _logs = new();
     _madePaints = new();
@@ -1380,23 +1662,24 @@ public class Palette
     AddCount = 0;
     Deviation = (0, CMY.MaxDistance * Targets.Count);
     TargetId = 0;
+
   }
 
-  public Cell this[int y, int x]
-  {
-    get
-    {
-      if (y < 0 || y >= Size || x < 0 || x >= Size) throw new ArgumentOutOfRangeException();
-      // return _cells[y, x];
-      return _dc.Get(y * Size + x);
-    }
-    private set
-    {
-      if (y < 0 || y >= Size || x < 0 || x >= Size) throw new ArgumentOutOfRangeException();
-      // _cells[y, x] = value;
-      _dc.SetValue(y * Size + x, value);
-    }
-  }
+  // public Cell this[int y, int x]
+  // {
+  //   get
+  //   {
+  //     if (y < 0 || y >= Size || x < 0 || x >= Size) throw new ArgumentOutOfRangeException();
+  //     // return _cells[y, x];
+  //     return _dc.Get(y * Size + x);
+  //   }
+  //   private set
+  //   {
+  //     if (y < 0 || y >= Size || x < 0 || x >= Size) throw new ArgumentOutOfRangeException();
+  //     // _cells[y, x] = value;
+  //     _dc.SetValue(y * Size + x, value);
+  //   }
+  // }
 
   // ターゲットとなる色を調合して差し出す一連の操作を行ったときのスコアの悪化量を取得する
   public double GetScoreDeltaByAddition(int addCount, CMY color)
@@ -1439,28 +1722,36 @@ public class Palette
   // 操作1に対応するメソッド
   private void Add(Coord coord, int tubeId)
   {
-    // 引数で指定したセルが属するウェルを取得
-    int cid = coord.Y * Size + coord.X;
-    var well = _dc.GetSum(cid);
+    // // 引数で指定したセルが属するウェルを取得
+    // int cid = coord.Y * Size + coord.X;
+    // var well = _dc.GetSum(cid);
 
-    // 追加する絵の具の情報を最大容量0のセルで表現
-    var tmpCell = new Cell(Tubes[tubeId], Math.Max(Math.Min(well.Capacity - well.Volume, 1), 0), 0);
+    // // 追加する絵の具の情報を最大容量0のセルで表現
+    // var tmpCell = new Cell(Tubes[tubeId], Math.Max(Math.Min(well.Capacity - well.Volume, 1), 0), 0);
 
-    // ウェルに合成してから各セルに再分配する
-    well += tmpCell;
-    foreach (int vid in _dc.GetVertices(cid))
-    {
-      _dc.SetValue(vid, well / _dc.ComponentSize(cid));
-    }
+    // // ウェルに合成してから各セルに再分配する
+    // well += tmpCell;
+    // foreach (int vid in _dc.GetVertices(cid))
+    // {
+    //   _dc.SetValue(vid, well / _dc.ComponentSize(cid));
+    // }
 
-    _dc.GetVertices(cid);
+    // _dc.GetVertices(cid);
+
+    _grid.Add(coord, Tubes[tubeId]);
     AddCount++;
   }
 
   // 操作2に対応するメソッド
   private void Give(Coord coord)
   {
-    var cell = Discard(coord, true);
+    // var cell = Discard(coord, true);
+    // double d = CMY.Distance(cell.Color, Targets[TargetId]).All;
+    // _madePaints.Add((cell.Color, d));
+    // Deviation = (Deviation.Definite + d, Deviation.Tentative - (CMY.MaxDistance - d));
+
+    var cell = _grid.GetCell(coord);
+    _grid.Discard(coord, true);
     double d = CMY.Distance(cell.Color, Targets[TargetId]).All;
     _madePaints.Add((cell.Color, d));
     Deviation = (Deviation.Definite + d, Deviation.Tentative - (CMY.MaxDistance - d));
@@ -1469,57 +1760,65 @@ public class Palette
   }
 
   // 操作3に対応するメソッド
-  private Cell Discard(Coord coord, bool strict)
+  private void Discard(Coord coord, bool strict)
   {
-    // 引数で指定したセルが属するウェルを取得
-    int cid = coord.Y * Size + coord.X;
-    var well = _dc.GetSum(cid);
+    // // 引数で指定したセルが属するウェルを取得
+    // int cid = coord.Y * Size + coord.X;
+    // var well = _dc.GetSum(cid);
 
-    // strictが有効で絵の具の量が1gに満たない場合は例外
-    if (well.Volume < 1 - 1e-6)
-    {
-      throw new InvalidOperationException("選択したウェルの絵の具の量が1g未満です。");
-    }
+    // // strictが有効で絵の具の量が1gに満たない場合は例外
+    // if (well.Volume < 1 - 1e-6)
+    // {
+    //   throw new InvalidOperationException("選択したウェルの絵の具の量が1g未満です。");
+    // }
 
-    // 取り出す絵の具の情報を最大容量0のセルで表現
-    double takenAmount = Math.Max(Math.Min(well.Capacity - well.Volume, 1), 0);
-    var taken = new Cell(well.Color, takenAmount, 0);
+    // // 取り出す絵の具の情報を最大容量0のセルで表現
+    // double takenAmount = Math.Max(Math.Min(well.Capacity - well.Volume, 1), 0);
+    // var taken = new Cell(well.Color, takenAmount, 0);
 
-    // 取り出す分だけ絵の具をウェルから廃棄し各セルに再分配する
-    well = new Cell(well.Color, well.Volume - takenAmount, well.Capacity);
-    foreach (int vid in _dc.GetVertices(cid))
-    {
-      _dc.SetValue(vid, well / _dc.ComponentSize(cid));
-    }
+    // // 取り出す分だけ絵の具をウェルから廃棄し各セルに再分配する
+    // well = new Cell(well.Color, well.Volume - takenAmount, well.Capacity);
+    // foreach (int vid in _dc.GetVertices(cid))
+    // {
+    //   _dc.SetValue(vid, well / _dc.ComponentSize(cid));
+    // }
 
-    return taken;
+    _grid.Discard(coord, false);
   }
 
   // 操作4に対応するメソッド
   private void SwitchDivider(Coord c1, Coord c2)
   {
-    throw new NotImplementedException();
+    if (c1.Y == c2.Y && c1.X + 1 == c2.X) SwitchDivider(c1, true);
+    else if (c1.Y + 1 == c2.Y && c1.X == c2.X) SwitchDivider(c1, false);
+    else throw new ArgumentException($"セル{c2}はセル{c1}の右隣または下隣には存在していません");
+  }
+
+  private void SwitchDivider(Coord coord, bool isVertical)
+  {
+    _grid.SwitchDivider(coord, isVertical);
   }
 
   public void Print(bool verbose = false)
   {
     // 仕切りの初期状態を出力
-    for (int i = 0; i < Size; i++)
-    {
-      for (int j = 0; j < Size - 1; j++)
-      {
-        Write($"{_verticalDividers[i, j]} ");
-      }
-      WriteLine();
-    }
-    for (int i = 0; i < Size - 1; i++)
-    {
-      for (int j = 0; j < Size; j++)
-      {
-        Write($"{_horizontalDividers[i, j]} ");
-      }
-      WriteLine();
-    }
+    // for (int i = 0; i < Size; i++)
+    // {
+    //   for (int j = 0; j < Size - 1; j++)
+    //   {
+    //     Write($"{_verticalDividers[i, j]} ");
+    //   }
+    //   WriteLine();
+    // }
+    // for (int i = 0; i < Size - 1; i++)
+    // {
+    //   for (int j = 0; j < Size; j++)
+    //   {
+    //     Write($"{_horizontalDividers[i, j]} ");
+    //   }
+    //   WriteLine();
+    // }
+    _grid.PrintSavedDividers();
 
     // ログを出力
     foreach ((int[] log, int v, double e) in _logs)
@@ -1581,7 +1880,7 @@ public static class Program
     var rand = new Random();
 
     // 1回のランダムな探索にかけられる実行時間
-    int maxRandomMicroSec = 500;
+    int maxRandomMicroSec = 1000;
 
     var plt = new Palette();
     for (int i = 0; i < H; i++)
