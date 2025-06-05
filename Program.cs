@@ -231,13 +231,13 @@ public class Grid
 {
   private static readonly int[] _dy = { -1, 0, 1, 0 };
   private static readonly int[] _dx = { 0, 1, 0, -1 };
-  private static int _nextgroupId = 1;
+  private static int _nextWellId = 1;
 
   private Cell[,] _cells;
 
-  private int[,] _groupId;
+  private int[,] _wellId;
 
-  private Dictionary<int, HashSet<Coord>> _groupList;
+  private Dictionary<int, HashSet<Coord>> _wellsDict;
 
   private bool[,] _verticalDividers;
 
@@ -247,9 +247,9 @@ public class Grid
 
   private bool[,] _savedHorizontalDividers;
 
-  public int Width => _groupId.GetLength(1);
+  public int Width => _wellId.GetLength(1);
 
-  public int Height => _groupId.GetLength(0);
+  public int Height => _wellId.GetLength(0);
 
   public Grid(int size, bool allDividersUp = false) : this(size, size, allDividersUp) { }
 
@@ -264,8 +264,8 @@ public class Grid
       }
     }
 
-    _groupId = new int[height, width];
-    _groupList = new();
+    _wellId = new int[height, width];
+    _wellsDict = new();
 
     _verticalDividers = new bool[height, width - 1];
     _horizontalDividers = new bool[height - 1, width];
@@ -287,11 +287,11 @@ public class Grid
         }
       }
 
-      UpdateConnectivity(new List<Coord>());
+      UpdateWellsId(new List<Coord>());
     }
     else
     {
-      UpdateConnectivity(new List<Coord>() { new Coord(0, 0) });
+      UpdateWellsId(new List<Coord>() { new Coord(0, 0) });
     }
 
     SaveDividers();
@@ -322,7 +322,7 @@ public class Grid
   [MethodImpl(256)]
   public Cell GetWell(int wellId)
   {
-    return GetWell(_groupList[wellId].First());
+    return GetWell(_wellsDict[wellId].First());
   }
 
   [MethodImpl(256)]
@@ -334,14 +334,14 @@ public class Grid
   public Cell GetWell(int y, int x)
   {
     var cell = _cells[y, x];
-    var group = _groupList[_groupId[y, x]];
+    var group = _wellsDict[_wellId[y, x]];
     return new Cell(cell.Color, cell.Volume * group.Count, cell.Capacity * group.Count);
   }
 
   // 指定したセル(が属するウェル)に絵の具を追加する
   public void Add(Coord coord, CMY color)
   {
-    var group = _groupList[_groupId[coord.Y, coord.X]];
+    var group = _wellsDict[_wellId[coord.Y, coord.X]];
     var startCell = _cells[coord.Y, coord.X];
 
     var add = new Cell(
@@ -359,7 +359,7 @@ public class Grid
   // 指定したセル(が属するウェル)に溜まっている絵の具を廃棄する
   public void Discard(Coord coord, bool strict)
   {
-    var group = _groupList[_groupId[coord.Y, coord.X]];
+    var group = _wellsDict[_wellId[coord.Y, coord.X]];
 
     // strictが有効で取り出し量が不足している場合は例外
     if (strict && !CanDiscardStrict(coord))
@@ -393,22 +393,51 @@ public class Grid
   }
 
   // 基準となるセルから見て縦方向なら右側、横方向なら下側の仕切りの状態を変更する 
-  public void SwitchDivider(Coord coord, bool isVertical)
+  public void SwitchDivider(Coord c1, bool isVertical)
   {
+    // 仕切りの状態を変更する
+    Coord c2;
     if (isVertical)
     {
-      _verticalDividers[coord.Y, coord.X] ^= true;
-      UpdateConnectivity(new Coord[] { coord, new Coord(coord.Y, coord.X + 1) });
+      _verticalDividers[c1.Y, c1.X] ^= true;
+      c2 = new Coord(c1.Y, c1.X + 1);
     }
     else
     {
-      _horizontalDividers[coord.Y, coord.X] ^= true;
-      UpdateConnectivity(new Coord[] { coord, new Coord(coord.Y + 1, coord.X) });
+      _horizontalDividers[c1.Y, c1.X] ^= true;
+      c2 = new Coord(c1.Y + 1, c1.X);
+    }
+
+    // 連結状態の変更前に隣り合うマスがそれぞれ属するウェルの情報を取得しておく
+    var oldWell1 = GetWell(_wellId[c1.Y, c1.X]);
+    var oldWell2 = GetWell(_wellId[c2.Y, c2.X]);
+
+    // ウェルのIDを更新する
+    (var newIds, var oldIds) = UpdateWellsId(new Coord[] { c1, c2 });
+
+    // 新しく発行されたIDのリストを参考に、各セルの状態を操作後にあるべき形にする
+    // 異なるウェルが連結になった場合は色を混ぜる処理を行い対象のセルに全て反映させる
+    if (oldIds.Count == 2 && newIds.Count == 1)
+    {
+      // 更新前に取得したウェルを合体させる
+      var newWell = oldWell1 + oldWell2;
+
+      // 新しく作られたウェルに属するセルの情報を構築し反映させる
+      var cell = new Cell(
+        newWell.Color,
+        newWell.Volume / _wellsDict[newIds[0]].Count,
+        newWell.Capacity / _wellsDict[newIds[0]].Count
+      );
+      foreach (Coord coord in _wellsDict[newIds[0]])
+      {
+        _cells[coord.Y, coord.X] = cell;
+      }
     }
   }
 
-  // 引数で指定したリストの要素を順に取り出し、それを始点としてBFSを行い連結状態を更新していく
-  private void UpdateConnectivity(IList<Coord> startPoints)
+  // 引数で渡された始点から順にBFSを行い、複数のウェルのIDを新しいものに更新する
+  // 操作によって新しく発行されたID、廃棄されたIDをそれぞれリストにして返す
+  private (List<int> newIds, List<int> oldIds) UpdateWellsId(IList<Coord> startPoints)
   {
     // 空のリストが渡された場合は全てのセルを始点として設定する
     if (startPoints.Count == 0)
@@ -423,18 +452,16 @@ public class Grid
     }
 
     // 一つずつ始点を決めて、BFSで始点と連結なマスを探していく
+    List<int> newIds = new();
+    List<int> oldIds = new();
     HashSet<Coord> visited = new();
-    HashSet<int> releasedGroupIds = new();
     foreach (Coord sp in startPoints)
     {
-      // 始点が現在属しているグループのIDをメモしておく
-      if (!releasedGroupIds.Contains(_groupId[sp.Y, sp.X]))
-      {
-        releasedGroupIds.Add(_groupId[sp.Y, sp.X]);
-      }
-
       // 探索済みなら始点を選び直す
       if (visited.Contains(sp)) continue;
+
+      // 新しいIDの発行・探索が確定するのでそれぞれ必要な情報を追加
+      newIds.Add(_nextWellId);
       visited.Add(sp);
 
       // BFSで連結なマスを探索していき1つのグループの情報を完成させる
@@ -443,9 +470,11 @@ public class Grid
       while (q.Count >= 1)
       {
         Coord cp = q.Dequeue();
-        _groupId[cp.Y, cp.X] = _nextgroupId;
-        if (!_groupList.ContainsKey(_nextgroupId)) _groupList[_nextgroupId] = new();
-        _groupList[_nextgroupId].Add(cp);
+        if (!oldIds.Contains(_wellId[cp.Y, cp.X])) oldIds.Add(_wellId[cp.Y, cp.X]);
+
+        _wellId[cp.Y, cp.X] = _nextWellId;
+        if (!_wellsDict.ContainsKey(_nextWellId)) _wellsDict[_nextWellId] = new();
+        _wellsDict[_nextWellId].Add(cp);
 
         for (int i = 0; i < _dy.Length; i++)
         {
@@ -462,15 +491,17 @@ public class Grid
       }
 
       // BFSが終わった時点で1つのグループの情報が確定するので次に付与するグループIDをずらす
-      _nextgroupId++;
+      _nextWellId++;
     }
 
     // 使われなくなったグループのリストを削除する(メモリ解放)
-    // foreach (int id in releasedGroupIds)
+    // foreach (int oldId in oldIds)
     // {
-    //   _groupList.Remove(id);
-    //   Error.WriteLine($"release! {id}");
+    //   _wellsDict.Remove(oldId);
+    //   // Error.WriteLine($"release! {oldId}");
     // }
+
+    return (newIds, oldIds);
   }
 
   // 現在の仕切りの状態をセーブする
@@ -524,16 +555,15 @@ public class Grid
     }
   }
 
-  // 各セルが現在どの番号のグループに属しているか一覧表示する
+  // 全セルの情報を一覧表示する
   public void PrintGroupStatus()
   {
     for (int i = 0; i < Height; i++)
     {
       for (int j = 0; j < Width; j++)
       {
-        Error.Write($"{_groupId[i, j]} ");
+        Error.WriteLine($"({i},{j}): {_cells[i, j]}[{_wellId[i, j]}]");
       }
-      Error.WriteLine();
     }
   }
 }
@@ -749,7 +779,7 @@ public class Palette
 
 public static class Program
 {
-  public static readonly long Timeout = 2900;
+  public static readonly long Timeout = 2950;
   public static readonly int[] DY = new int[] { -1, 0, 1, 0 };
   public static readonly int[] DX = new int[] { 0, 1, 0, -1 };
   private static readonly Random _rand = new();
@@ -967,6 +997,24 @@ public static class Program
         }
       }
 
+      // 全方向が仕切りで囲まれているセルが存在しないように仕切りの状態を調整する
+      for (int cy = 0; cy < N; cy++)
+      {
+        for (int cx = 0; cx < N; cx++)
+        {
+          bool isEnclosed = true;
+          try { if (!verticalDividers[cy, cx]) isEnclosed = false; } catch { }
+          try { if (!horizontalDividers[cy, cx]) isEnclosed = false; } catch { }
+          try { if (!verticalDividers[cy, cx - 1]) isEnclosed = false; } catch { }
+          try { if (!horizontalDividers[cy - 1, cx]) isEnclosed = false; } catch { }
+          if (isEnclosed)
+          {
+            try { verticalDividers[cy, cx] ^= true; }
+            catch { verticalDividers[cy, cx - 1] ^= true; }
+          }
+        }
+      }
+
       // パレットの作成
       var plt = new Palette(verticalDividers, horizontalDividers);
 
@@ -978,6 +1026,17 @@ public static class Program
           plt.Operate(new int[] { 1, i, j, _rand.Next(0, Tubes.Count) });
         }
       }
+
+      // 仕切りを破壊する起点となるセルのリストを作成
+      List<Coord> dividerBreakOrigins = new();
+      for (int i = 0; i < N - 1; i++)
+      {
+        for (int j = 0; j < N - 1; j++)
+        {
+          dividerBreakOrigins.Add(new Coord(i, j));
+        }
+      }
+      dividerBreakOrigins.Shuffle();
 
       while (!plt.IsSubmittable() && TimeKeeper.ElapsedMillisec() < Timeout)
       {
@@ -1005,19 +1064,22 @@ public static class Program
           plt.Operate(new int[] { 1, best.Coord.Y, best.Coord.X, _rand.Next(0, Tubes.Count) });
         }
         // 新しく絵の具が追加されなくなったら仕切りを少しずつ壊していく
-        // else
-        // {
-        //   // 縦方向の仕切りがあれば下げる
-        //   if (best.Coord.X < N - 1 && plt.IsDividerUp(best.Coord, true))
-        //   {
-        //     plt.Operate(new int[] { 4, best.Coord.Y, best.Coord.X, best.Coord.Y, best.Coord.X + 1 });
-        //   }
-        //   // 横方向の仕切りがあれば下げる
-        //   if (best.Coord.Y < N - 1 && plt.IsDividerUp(best.Coord, false))
-        //   {
-        //     plt.Operate(new int[] { 4, best.Coord.Y, best.Coord.X, best.Coord.Y + 1, best.Coord.X });
-        //   }
-        // }
+        else if (Targets.Count - plt.TargetId < 200 && dividerBreakOrigins.Count >= 1)
+        {
+          var origin = dividerBreakOrigins.Last();
+          dividerBreakOrigins.RemoveAt(dividerBreakOrigins.Count - 1);
+
+          // 縦方向の仕切りがあれば下げる
+          if (plt.IsDividerUp(origin, true))
+          {
+            plt.Operate(new int[] { 4, origin.Y, origin.X, origin.Y, origin.X + 1 });
+          }
+          // 横方向の仕切りがあれば下げる
+          if (plt.IsDividerUp(origin, false))
+          {
+            plt.Operate(new int[] { 4, origin.Y, origin.X, origin.Y + 1, origin.X });
+          }
+        }
       }
 
       // 評価スコアが元より高くなるなら更新する
