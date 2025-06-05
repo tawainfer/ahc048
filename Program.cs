@@ -339,14 +339,14 @@ public class Grid
   }
 
   // 指定したセル(が属するウェル)に絵の具を追加する
-  public void Add(Coord coord, CMY color, double grams = 1)
+  public void Add(Coord coord, CMY color)
   {
     var group = _groupList[_groupId[coord.Y, coord.X]];
     var startCell = _cells[coord.Y, coord.X];
 
     var add = new Cell(
       color,
-      Math.Min(grams / group.Count, (double)startCell.Capacity - startCell.Volume),
+      Math.Min(1.0 / group.Count, (double)startCell.Capacity - startCell.Volume),
       0
     );
 
@@ -357,14 +357,12 @@ public class Grid
   }
 
   // 指定したセル(が属するウェル)に溜まっている絵の具を廃棄する
-  public void Discard(Coord coord, bool strict, double grams = 1)
+  public void Discard(Coord coord, bool strict)
   {
     var group = _groupList[_groupId[coord.Y, coord.X]];
-    Cell startCell = _cells[coord.Y, coord.X];
-    Cell well = GetWell(coord);
 
     // strictが有効で取り出し量が不足している場合は例外
-    if (strict && well.Volume < grams - 1e-6)
+    if (strict && !CanDiscardStrict(coord))
     {
       throw new InvalidOperationException("選択したウェルから取り出せる絵の具の量の上限を超えています");
     }
@@ -373,9 +371,16 @@ public class Grid
     {
       _cells[c.Y, c.X] = new Cell(
         _cells[c.Y, c.X].Color,
-        _cells[c.Y, c.X].Volume - grams / group.Count,
+        _cells[c.Y, c.X].Volume - 1.0 / group.Count,
         _cells[c.Y, c.X].Capacity);
     }
+  }
+
+  // 指定した量だけ絵の具を取り出す操作が厳密に行えるか判定する
+  [MethodImpl(256)]
+  public bool CanDiscardStrict(Coord coord)
+  {
+    return GetWell(coord).Volume >= 1 - 1e-6;
   }
 
   // 基準となるセルから見て縦方向なら右側、横方向なら下側の仕切りが上がっているか確認する
@@ -461,11 +466,11 @@ public class Grid
     }
 
     // 使われなくなったグループのリストを削除する(メモリ解放)
-    foreach (int id in releasedGroupIds)
-    {
-      _groupList.Remove(id);
-      Error.WriteLine($"release! {id}");
-    }
+    // foreach (int id in releasedGroupIds)
+    // {
+    //   _groupList.Remove(id);
+    //   Error.WriteLine($"release! {id}");
+    // }
   }
 
   // 現在の仕切りの状態をセーブする
@@ -516,6 +521,19 @@ public class Grid
       {
         Write($"{(horizontal[i, j] ? 1 : 0)} ");
       }
+    }
+  }
+
+  // 各セルが現在どの番号のグループに属しているか一覧表示する
+  public void PrintGroupStatus()
+  {
+    for (int i = 0; i < Height; i++)
+    {
+      for (int j = 0; j < Width; j++)
+      {
+        Error.Write($"{_groupId[i, j]} ");
+      }
+      Error.WriteLine();
     }
   }
 }
@@ -614,6 +632,14 @@ public class Palette
     _grid.SaveDividers();
   }
 
+  public Cell this[int y, int x]
+  {
+    get
+    {
+      return _grid[y, x];
+    }
+  }
+
   // ターゲットとなる色を調合して差し出す一連の操作を行ったときのスコアの悪化量を取得する
   [MethodImpl(256)]
   public double GetScoreDeltaByAddition(int addCount, CMY color)
@@ -678,6 +704,9 @@ public class Palette
     _grid.Discard(coord, false);
   }
 
+  [MethodImpl(256)]
+  public bool CanDiscardStrict(Coord coord) => _grid.CanDiscardStrict(coord);
+
   // 操作4に対応するメソッド
   private void SwitchDivider(Coord c1, Coord c2)
   {
@@ -692,10 +721,21 @@ public class Palette
     _grid.SwitchDivider(coord, isVertical);
   }
 
-  // 現在の仕切りの状態をセーブする
+  [MethodImpl(256)]
+  public bool IsDividerUp(Coord coord, bool isVertical)
+  {
+    return _grid.IsDividerUp(coord, isVertical);
+  }
+
+  [MethodImpl(256)]
+  public void PrintGroupStatus()
+  {
+    _grid.PrintGroupStatus();
+  }
 
   public void Print(bool verbose = false)
   {
+    // 保存された仕切りの状態を出力
     _grid.PrintSavedDividers();
 
     // ログを出力
@@ -709,6 +749,7 @@ public class Palette
 
 public static class Program
 {
+  public static readonly long Timeout = 2900;
   public static readonly int[] DY = new int[] { -1, 0, 1, 0 };
   public static readonly int[] DX = new int[] { 0, 1, 0, -1 };
   private static readonly Random _rand = new();
@@ -726,7 +767,8 @@ public static class Program
   {
     TimeKeeper.Start();
     Input();
-    Greedy();
+    // Greedy();
+    Greedy2();
   }
 
   public static void Input()
@@ -900,5 +942,94 @@ public static class Program
     }
 
     plt.Print();
+  }
+
+  public static void Greedy2()
+  {
+    // 時間いっぱい適当な盤面を作っていき最適なものを選択する
+    var bestPalette = new Palette();
+    int searchCount = 0;
+    while (TimeKeeper.ElapsedMillisec() < Timeout)
+    {
+      searchCount++;
+
+      // 仕切りの設計
+      // 全てランダムに配置する
+      int dividerUpPercent = _rand.Next(30, 70);
+      bool[,] verticalDividers = new bool[N, N - 1];
+      bool[,] horizontalDividers = new bool[N - 1, N];
+      for (int i = 0; i < N; i++)
+      {
+        for (int j = 0; j < N - 1; j++)
+        {
+          verticalDividers[i, j] = _rand.Next(0, 100) < dividerUpPercent;
+          horizontalDividers[j, i] = _rand.Next(0, 100) < dividerUpPercent;
+        }
+      }
+
+      // パレットの作成
+      var plt = new Palette(verticalDividers, horizontalDividers);
+
+      // 全てのセルを対象に1gずつランダムな絵の具をセットしていく
+      for (int i = 0; i < Palette.Size; i++)
+      {
+        for (int j = 0; j < Palette.Size; j++)
+        {
+          plt.Operate(new int[] { 1, i, j, _rand.Next(0, Tubes.Count) });
+        }
+      }
+
+      while (!plt.IsSubmittable() && TimeKeeper.ElapsedMillisec() < Timeout)
+      {
+        // 全てのマスを見て一番誤差の小さい色が置かれているマスを特定する
+        (double Delta, Coord Coord) best = (double.MaxValue, new Coord(-1, -1));
+        for (int i = 0; i < N; i++)
+        {
+          for (int j = 0; j < N; j++)
+          {
+            if (!plt.CanDiscardStrict(new Coord(i, j))) continue;
+            double delta = CMY.Distance(plt[i, j].Color, Targets[plt.TargetId]).All;
+            if (delta < best.Delta)
+            {
+              best = (delta, new Coord(i, j));
+            }
+          }
+        }
+
+        // 絵の具を差し出す操作を実行
+        plt.Operate(new int[] { 2, best.Coord.Y, best.Coord.X });
+
+        // 絵の具を追加した回数がターゲットの総数に満たない場合は絵の具を新しく追加
+        if (plt.AddCount < Targets.Count)
+        {
+          plt.Operate(new int[] { 1, best.Coord.Y, best.Coord.X, _rand.Next(0, Tubes.Count) });
+        }
+        // 新しく絵の具が追加されなくなったら仕切りを少しずつ壊していく
+        // else
+        // {
+        //   // 縦方向の仕切りがあれば下げる
+        //   if (best.Coord.X < N - 1 && plt.IsDividerUp(best.Coord, true))
+        //   {
+        //     plt.Operate(new int[] { 4, best.Coord.Y, best.Coord.X, best.Coord.Y, best.Coord.X + 1 });
+        //   }
+        //   // 横方向の仕切りがあれば下げる
+        //   if (best.Coord.Y < N - 1 && plt.IsDividerUp(best.Coord, false))
+        //   {
+        //     plt.Operate(new int[] { 4, best.Coord.Y, best.Coord.X, best.Coord.Y + 1, best.Coord.X });
+        //   }
+        // }
+      }
+
+      // 評価スコアが元より高くなるなら更新する
+      if (plt.EvaluatedScore < bestPalette.EvaluatedScore)
+      {
+        Error.WriteLine($"update! searchCount={searchCount} dividerUpPercent={dividerUpPercent}");
+        Error.WriteLine($"{bestPalette.EvaluatedScore} -> {plt.EvaluatedScore}");
+        bestPalette = plt;
+      }
+    }
+
+    Error.WriteLine($"finish! searchCount={searchCount}");
+    bestPalette.Print();
   }
 }
