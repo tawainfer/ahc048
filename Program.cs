@@ -229,27 +229,22 @@ public class Cell
 
 public class Grid
 {
-  private static readonly int[] _dy = { -1, 0, 1, 0 };
-  private static readonly int[] _dx = { 0, 1, 0, -1 };
-  private static int _nextWellId = 1;
+  protected static readonly int[] _dy = { -1, 0, 1, 0 };
+  protected static readonly int[] _dx = { 0, 1, 0, -1 };
+  protected static int _nextWellId = 1;
 
-  private Cell[,] _cells;
-
-  private int[,] _wellId;
-
-  private Dictionary<int, HashSet<Coord>> _wellsDict;
-
-  private bool[,] _verticalDividers;
-
-  private bool[,] _horizontalDividers;
-
-  private bool[,] _savedVerticalDividers;
-
-  private bool[,] _savedHorizontalDividers;
-
-  public int Width => _wellId.GetLength(1);
+  protected Cell[,] _cells;
+  protected int[,] _wellId;
+  protected Dictionary<int, HashSet<Coord>> _wellsDict;
+  protected bool[,] _verticalDividers;
+  protected bool[,] _horizontalDividers;
+  protected bool[,] _savedVerticalDividers;
+  protected bool[,] _savedHorizontalDividers;
 
   public int Height => _wellId.GetLength(0);
+  public int Width => _wellId.GetLength(1);
+
+  public IReadOnlyCollection<int> AvailableWellIds => _wellsDict.Keys;
 
   public Grid(int size, bool allDividersUp = false) : this(size, size, allDividersUp) { }
 
@@ -338,6 +333,13 @@ public class Grid
     return new Cell(cell.Color, cell.Volume * group.Count, cell.Capacity * group.Count);
   }
 
+  // ウェルに属するセルの一覧を取得する
+  [MethodImpl(256)]
+  public IReadOnlyCollection<Coord> GetCellsInWell(int wellId)
+  {
+    return _wellsDict[wellId];
+  }
+
   // 指定したセル(が属するウェル)に絵の具を追加する
   public void Add(Coord coord, CMY color)
   {
@@ -378,10 +380,13 @@ public class Grid
 
   // 指定した量だけ絵の具を取り出す操作が厳密に行えるか判定する
   [MethodImpl(256)]
-  public bool CanDiscardStrict(Coord coord)
-  {
-    return GetWell(coord).Volume >= 1 - 1e-6;
-  }
+  public bool CanDiscardStrict(Coord coord) => CanDiscardStrict(GetWell(coord));
+
+  [MethodImpl(256)]
+  public bool CanDiscardStrict(int wellId) => CanDiscardStrict(GetWell(wellId));
+
+  [MethodImpl(256)]
+  private bool CanDiscardStrict(Cell well) => well.Volume >= 1 - 1e-6;
 
   // 基準となるセルから見て縦方向なら右側、横方向なら下側の仕切りが上がっているか確認する
   [MethodImpl(256)]
@@ -437,7 +442,7 @@ public class Grid
 
   // 引数で渡された始点から順にBFSを行い、複数のウェルのIDを新しいものに更新する
   // 操作によって新しく発行されたID、廃棄されたIDをそれぞれリストにして返す
-  private (List<int> newIds, List<int> oldIds) UpdateWellsId(IList<Coord> startPoints)
+  protected (List<int> newIds, List<int> oldIds) UpdateWellsId(IList<Coord> startPoints)
   {
     // 空のリストが渡された場合は全てのセルを始点として設定する
     if (startPoints.Count == 0)
@@ -494,12 +499,11 @@ public class Grid
       _nextWellId++;
     }
 
-    // 使われなくなったグループのリストを削除する(メモリ解放)
-    // foreach (int oldId in oldIds)
-    // {
-    //   _wellsDict.Remove(oldId);
-    //   // Error.WriteLine($"release! {oldId}");
-    // }
+    // 使われなくなったウェルのIDに結び付くリストを削除する
+    foreach (int oldId in oldIds)
+    {
+      _wellsDict.Remove(oldId);
+    }
 
     return (newIds, oldIds);
   }
@@ -568,7 +572,7 @@ public class Grid
   }
 }
 
-public class Palette
+public class Palette : Grid
 {
   public static readonly int Size;
   public static readonly int MaxTurns;
@@ -581,28 +585,21 @@ public class Palette
     Cost = D;
   }
 
-  private Grid _grid;
-
   private List<(int[] Log, int VisualizedScore, double EvaluatedScore)> _logs;
-
   private List<(CMY Color, double Deviation)> _madePaints;
 
   public int OpCount { get; private set; }
-
   public int AddCount { get; private set; }
-
   public (double Definite, double Tentative) Deviation { get; private set; }
-
   public int TargetId { get; private set; }
 
   public int VisualizedScore => (int)(1 + Cost * (AddCount - _madePaints.Count) + Math.Round(1e4 * Deviation.Definite));
-
   public double EvaluatedScore => 1 + Cost * Math.Max(AddCount - Targets.Count, 0) + Math.Round(1e4 * Deviation.Tentative);
 
-  public Palette()
-  {
-    _grid = new Grid(Size, false);
+  public IReadOnlyList<(CMY Color, double Deviation)> MadePaints => _madePaints;
 
+  public Palette() : base(Size, false)
+  {
     _logs = new();
     _madePaints = new();
 
@@ -618,9 +615,9 @@ public class Palette
     {
       for (int j = 0; j < verticalDividers.GetLength(1); j++)
       {
-        if ((verticalDividers[i, j] == 1) ^ _grid.IsDividerUp(new Coord(i, j), true))
+        if ((verticalDividers[i, j] == 1) ^ IsDividerUp(new Coord(i, j), true))
         {
-          _grid.SwitchDivider(new Coord(i, j), true);
+          SwitchDivider(new Coord(i, j), true);
         }
       }
     }
@@ -628,13 +625,13 @@ public class Palette
     {
       for (int j = 0; j < horizontalDividers.GetLength(1); j++)
       {
-        if ((horizontalDividers[i, j] == 1) ^ _grid.IsDividerUp(new Coord(i, j), false))
+        if ((horizontalDividers[i, j] == 1) ^ IsDividerUp(new Coord(i, j), false))
         {
-          _grid.SwitchDivider(new Coord(i, j), false);
+          SwitchDivider(new Coord(i, j), false);
         }
       }
     }
-    _grid.SaveDividers();
+    SaveDividers();
   }
 
   public Palette(bool[,] verticalDividers, bool[,] horizontalDividers) : this()
@@ -643,9 +640,9 @@ public class Palette
     {
       for (int j = 0; j < verticalDividers.GetLength(1); j++)
       {
-        if (verticalDividers[i, j] ^ _grid.IsDividerUp(new Coord(i, j), true))
+        if (verticalDividers[i, j] ^ IsDividerUp(new Coord(i, j), true))
         {
-          _grid.SwitchDivider(new Coord(i, j), true);
+          SwitchDivider(new Coord(i, j), true);
         }
       }
     }
@@ -653,21 +650,13 @@ public class Palette
     {
       for (int j = 0; j < horizontalDividers.GetLength(1); j++)
       {
-        if (horizontalDividers[i, j] ^ _grid.IsDividerUp(new Coord(i, j), false))
+        if (horizontalDividers[i, j] ^ IsDividerUp(new Coord(i, j), false))
         {
-          _grid.SwitchDivider(new Coord(i, j), false);
+          SwitchDivider(new Coord(i, j), false);
         }
       }
     }
-    _grid.SaveDividers();
-  }
-
-  public Cell this[int y, int x]
-  {
-    get
-    {
-      return _grid[y, x];
-    }
+    SaveDividers();
   }
 
   // ターゲットとなる色を調合して差し出す一連の操作を行ったときのスコアの悪化量を取得する
@@ -696,7 +685,7 @@ public class Palette
         Give(new Coord(args[1], args[2]));
         break;
       case 3:
-        Discard(new Coord(args[1], args[2]), false);
+        base.Discard(new Coord(args[1], args[2]), false);
         break;
       case 4:
         SwitchDivider(new Coord(args[1], args[2]), new Coord(args[3], args[4]));
@@ -712,30 +701,21 @@ public class Palette
   // 操作1に対応するメソッド
   private void Add(Coord coord, int tubeId)
   {
-    _grid.Add(coord, Tubes[tubeId]);
+    base.Add(coord, Tubes[tubeId]);
     AddCount++;
   }
 
   // 操作2に対応するメソッド
   private void Give(Coord coord)
   {
-    var cell = _grid.GetCell(coord);
-    _grid.Discard(coord, true);
+    var cell = GetCell(coord);
+    base.Discard(coord, true);
     double d = CMY.Distance(cell.Color, Targets[TargetId]).All;
     _madePaints.Add((cell.Color, d));
     Deviation = (Deviation.Definite + d, Deviation.Tentative - (CMY.MaxDistance - d));
 
     TargetId++;
   }
-
-  // 操作3に対応するメソッド
-  private void Discard(Coord coord, bool strict)
-  {
-    _grid.Discard(coord, false);
-  }
-
-  [MethodImpl(256)]
-  public bool CanDiscardStrict(Coord coord) => _grid.CanDiscardStrict(coord);
 
   // 操作4に対応するメソッド
   private void SwitchDivider(Coord c1, Coord c2)
@@ -745,28 +725,10 @@ public class Palette
     else throw new ArgumentException($"セル{c2}はセル{c1}の右隣または下隣には存在していません");
   }
 
-  [MethodImpl(256)]
-  private void SwitchDivider(Coord coord, bool isVertical)
-  {
-    _grid.SwitchDivider(coord, isVertical);
-  }
-
-  [MethodImpl(256)]
-  public bool IsDividerUp(Coord coord, bool isVertical)
-  {
-    return _grid.IsDividerUp(coord, isVertical);
-  }
-
-  [MethodImpl(256)]
-  public void PrintGroupStatus()
-  {
-    _grid.PrintGroupStatus();
-  }
-
   public void Print(bool verbose = false)
   {
     // 保存された仕切りの状態を出力
-    _grid.PrintSavedDividers();
+    PrintSavedDividers();
 
     // ログを出力
     foreach ((int[] log, int v, double e) in _logs)
@@ -985,7 +947,7 @@ public static class Program
 
       // 仕切りの設計
       // 全てランダムに配置する
-      int dividerUpPercent = _rand.Next(30, 70);
+      int dividerUpPercent = _rand.Next(60, 80);
       bool[,] verticalDividers = new bool[N, N - 1];
       bool[,] horizontalDividers = new bool[N - 1, N];
       for (int i = 0; i < N; i++)
@@ -1040,18 +1002,33 @@ public static class Program
 
       while (!plt.IsSubmittable() && TimeKeeper.ElapsedMillisec() < Timeout)
       {
-        // 全てのマスを見て一番誤差の小さい色が置かれているマスを特定する
+        // // 全てのマスを見て一番誤差の小さい色が置かれているマスを特定する
+        // (double Delta, Coord Coord) best = (double.MaxValue, new Coord(-1, -1));
+        // for (int i = 0; i < N; i++)
+        // {
+        //   for (int j = 0; j < N; j++)
+        //   {
+        //     if (!plt.CanDiscardStrict(new Coord(i, j))) continue;
+        //     double delta = CMY.Distance(plt[i, j].Color, Targets[plt.TargetId]).All;
+        //     if (delta < best.Delta)
+        //     {
+        //       best = (delta, new Coord(i, j));
+        //     }
+        //   }
+        // }
+
+        // 全てのウェルを見て一番誤差の小さい色が置かれている場所を特定する
         (double Delta, Coord Coord) best = (double.MaxValue, new Coord(-1, -1));
-        for (int i = 0; i < N; i++)
+        foreach (int wellId in plt.AvailableWellIds)
         {
-          for (int j = 0; j < N; j++)
+          // ウェルから絵の具を取り出せない場合はスキップする
+          if (!plt.CanDiscardStrict(wellId)) continue;
+
+          var coord = plt.GetCellsInWell(wellId).First();
+          double delta = CMY.Distance(plt[coord.Y, coord.X].Color, Targets[plt.TargetId]).All;
+          if (delta < best.Delta)
           {
-            if (!plt.CanDiscardStrict(new Coord(i, j))) continue;
-            double delta = CMY.Distance(plt[i, j].Color, Targets[plt.TargetId]).All;
-            if (delta < best.Delta)
-            {
-              best = (delta, new Coord(i, j));
-            }
+            best = (delta, new Coord(coord.Y, coord.X));
           }
         }
 
