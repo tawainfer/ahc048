@@ -1422,7 +1422,179 @@ public static class Program
 
   public static void Greedy4()
   {
-    if (D >= 100) Greedy2();
-    else Greedy3();
+    // 数ターン分、絵の具の組み合わせを全探索する
+    // 作成した色から使用した絵の具の組み合わせを解決する辞書も同時に作成する
+    var points = new (CMY Color, int Turn)[PrecomputeData[K].CalcCount];
+    Dictionary<CMY, int[]> colorToTubeIds = new();
+    int idx = 0;
+    for (int mcnt = 1; mcnt <= PrecomputeData[K].MixingCount; mcnt++)
+    {
+      int[] tubeIds = new int[mcnt];
+      CMY colorSum = tubeIds.Select((id) => Tubes[id]).Sum();
+
+      for (int i = 0; i < (int)Math.Pow(K, mcnt); i++)
+      {
+        CMY color = colorSum / mcnt;
+        points[idx] = (color, mcnt);
+        if (!colorToTubeIds.ContainsKey(color))
+        {
+          colorToTubeIds[color] = new int[tubeIds.Length];
+          for (int j = 0; j < tubeIds.Length; j++) colorToTubeIds[color][j] = tubeIds[j];
+        }
+        idx++;
+
+        for (int pos = mcnt - 1; pos >= 0; pos--)
+        {
+          colorSum -= Tubes[tubeIds[pos]];
+          tubeIds[pos]++;
+
+          if (tubeIds[pos] < K)
+          {
+            colorSum += Tubes[tubeIds[pos]];
+            break;
+          }
+
+          tubeIds[pos] = 0;
+          colorSum += Tubes[tubeIds[pos]];
+        }
+      }
+    }
+
+    // 調合で完成した色とかかったターンの情報がまとまっているリストを渡してKD木を構築
+    var kdt = new KDTree(points);
+
+    // 仕切りの設計
+    // int dividerUpPercent = _rand.Next(30, 50);
+    int dividerUpPercent = 100;
+    bool[,] verticalDividers = new bool[N, N - 1];
+    bool[,] horizontalDividers = new bool[N - 1, N];
+    for (int i = 0; i < N; i++)
+    {
+      for (int j = 0; j < N - 1; j++)
+      {
+        verticalDividers[i, j] = _rand.Next(0, 100) < dividerUpPercent;
+        horizontalDividers[j, i] = _rand.Next(0, 100) < dividerUpPercent;
+      }
+    }
+
+    // 全方向が仕切りで囲まれているセルが存在しないように仕切りの状態を調整する
+    for (int cy = 0; cy < N - 1; cy += 2)
+    {
+      for (int cx = 0; cx < N - 1; cx += 2)
+      {
+        if (_rand.Next(0, 2) == 0) horizontalDividers[cy, cx] = false;
+        verticalDividers[cy, cx] = false;
+      }
+    }
+    for (int cy = 1; cy < N; cy += 2)
+    {
+      for (int cx = 0; cx < N; cx++)
+      {
+        bool isEnclosed = true;
+        try { if (!verticalDividers[cy, cx]) isEnclosed = false; } catch { }
+        try { if (!horizontalDividers[cy, cx]) isEnclosed = false; } catch { }
+        try { if (!verticalDividers[cy, cx - 1]) isEnclosed = false; } catch { }
+        try { if (!horizontalDividers[cy - 1, cx]) isEnclosed = false; } catch { }
+        if (isEnclosed)
+        {
+          int d = _rand.Next(0, 2);
+          try { horizontalDividers[cy - d, cx] = false; }
+          catch { horizontalDividers[cy - (d ^ 1), cx] = false; }
+        }
+      }
+    }
+    for (int cy = 0; cy < N; cy += 2)
+    {
+      for (int cx = 0; cx < N; cx += 2)
+      {
+        bool isEnclosed = true;
+        try { if (!horizontalDividers[cy - 1, cx]) isEnclosed = false; } catch { }
+        try { if (!horizontalDividers[cy, cx]) isEnclosed = false; } catch { }
+        try { if (!verticalDividers[cy, cx - 1]) isEnclosed = false; } catch { }
+        try { if (!horizontalDividers[cy - 1, cx + 1]) isEnclosed = false; } catch { }
+        try { if (!verticalDividers[cy, cx + 1]) isEnclosed = false; } catch { }
+        try { if (!horizontalDividers[cy, cx + 1]) isEnclosed = false; } catch { }
+        if (isEnclosed)
+        {
+          try { verticalDividers[cy, cx + 1] = false; }
+          catch { verticalDividers[cy, cx - 1] = false; }
+        }
+      }
+    }
+
+    // パレットの作成
+    var plt = new Palette(verticalDividers, horizontalDividers);
+
+    // 全てのウェルが埋まるまでターゲットとなる色を順に盤面で作成していく
+    int wellCount = 0;
+    foreach (int wellId in plt.AvailableWellIds)
+    {
+      var well = plt.GetWell(wellId);
+      Coord representative = plt.GetCellsInWell(wellId).First();
+
+      var nearest = kdt.FindNearest(Targets[wellCount], well.Capacity);
+      var tubeIds = colorToTubeIds[(CMY)nearest?.Color];
+
+      foreach (int tubeId in tubeIds)
+      {
+        plt.Operate(new int[] { 1, representative.Y, representative.X, tubeId });
+      }
+
+      wellCount++;
+    }
+
+    for (int i = 0; i < H; i++)
+    {
+      (CMY Color, double scoreDelta, List<int[]> Operations) bestOperate = (new CMY(-1, -1, -1), double.MaxValue, new());
+
+      // 全てのウェルを探索する
+      foreach (int wellId in plt.AvailableWellIds)
+      {
+        var well = plt.GetWell(wellId);
+        Coord representative = plt.GetCellsInWell(wellId).First();
+
+        // 既にウェルに溜まっている絵の具を差し出す
+        if (plt.CanDiscardStrict(wellId))
+        {
+          double scoreDelta = plt.GetScoreDeltaByAddition(0, well.Color);
+          if (scoreDelta < bestOperate.scoreDelta)
+          {
+            bestOperate = (well.Color, scoreDelta, new() {
+              new int[] { 2, representative.Y, representative.X }
+            });
+          }
+        }
+
+        // 空のウェルに最適な絵の具を作り出す
+        if (well.Volume < 1e-6)
+        {
+          var nearest = kdt.FindNearest(Targets[plt.TargetId], well.Capacity);
+          var tubeIds = colorToTubeIds[(CMY)nearest?.Color];
+
+          List<int[]> operations = new();
+          foreach (int tubeId in tubeIds)
+          {
+            operations.Add(new int[] { 1, representative.Y, representative.X, tubeId });
+          }
+          operations.Add(new int[] { 2, representative.Y, representative.X });
+
+          double scoreDelta = plt.GetScoreDeltaByAddition(
+            Math.Min(tubeIds.Length, Math.Max(plt.AddCount - H, 0)),
+            (CMY)nearest?.Color);
+          if (scoreDelta < bestOperate.scoreDelta)
+          {
+            bestOperate = ((CMY)nearest?.Color, scoreDelta, operations);
+          }
+        }
+      }
+
+      // 最も良い手順に従って操作を行う
+      foreach (var operation in bestOperate.Operations)
+      {
+        plt.Operate(operation);
+      }
+    }
+
+    plt.Print();
   }
 }
