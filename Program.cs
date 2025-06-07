@@ -1582,7 +1582,7 @@ public static class Program
             }
           }
 
-          // 空のウェルに最適な絵の具を作り出す
+          // 空のウェルに最適な絵の具を作り出して差し出す
           if (well.Volume < 1e-6)
           {
             int searchTurn = Math.Min(well.Capacity, PrecomputeData[K].MixingCount);
@@ -1602,6 +1602,26 @@ public static class Program
             if (scoreDelta < bestOperate.scoreDelta)
             {
               bestOperate = ((CMY)nearest?.Color, scoreDelta, operations);
+            }
+          }
+
+          // ウェルに1gの絵の具を追加して差し出す
+          if (well.Volume + 1 < well.Capacity + 1e-6)
+          {
+            for (int tubeId = 0; tubeId < Tubes.Count; tubeId++)
+            {
+              CMY tube = Tubes[tubeId];
+              var tmpCell = well + new Cell(tube, 1, 0);
+              double scoreDelta = plt.GetScoreDeltaByAddition(
+                Math.Min(1, Math.Max(plt.AddCount - H, 0)),
+                tmpCell.Color);
+              if (scoreDelta < bestOperate.scoreDelta)
+              {
+                bestOperate = (tmpCell.Color, scoreDelta, new() {
+                  new int[] { 1, representative.Y, representative.X, tubeId },
+                  new int[] { 2, representative.Y, representative.X }
+                });
+              }
             }
           }
         }
