@@ -1422,26 +1422,33 @@ public static class Program
 
   public static void Greedy4()
   {
+    // 複数のKD木を格納した配列
+    // [0]のKD木は全ての状態を持つ
+    // [1~Length-1]のKD木は添字に対応するターン数の状態だけを管理する
+    var kdtree = new KDTree[PrecomputeData[K].CalcCount + 1];
+
     // 数ターン分、絵の具の組み合わせを全探索する
     // 作成した色から使用した絵の具の組み合わせを解決する辞書も同時に作成する
-    var points = new (CMY Color, int Turn)[PrecomputeData[K].CalcCount];
+    // var points = new (CMY Color, int Turn)[PrecomputeData[K].CalcCount];
+    List<(CMY Color, int Turn)> allPoints = new();
     Dictionary<CMY, int[]> colorToTubeIds = new();
-    int idx = 0;
     for (int mcnt = 1; mcnt <= PrecomputeData[K].MixingCount; mcnt++)
     {
+      List<(CMY Color, int Turn)> currentPoints = new();
       int[] tubeIds = new int[mcnt];
       CMY colorSum = tubeIds.Select((id) => Tubes[id]).Sum();
 
       for (int i = 0; i < (int)Math.Pow(K, mcnt); i++)
       {
         CMY color = colorSum / mcnt;
-        points[idx] = (color, mcnt);
+        allPoints.Add((color, mcnt));
+        currentPoints.Add((color, mcnt));
+
         if (!colorToTubeIds.ContainsKey(color))
         {
           colorToTubeIds[color] = new int[tubeIds.Length];
           for (int j = 0; j < tubeIds.Length; j++) colorToTubeIds[color][j] = tubeIds[j];
         }
-        idx++;
 
         for (int pos = mcnt - 1; pos >= 0; pos--)
         {
@@ -1458,10 +1465,10 @@ public static class Program
           colorSum += Tubes[tubeIds[pos]];
         }
       }
-    }
 
-    // 調合で完成した色とかかったターンの情報がまとまっているリストを渡してKD木を構築
-    var kdt = new KDTree(points);
+      kdtree[mcnt] = new KDTree(currentPoints);
+    }
+    kdtree[0] = new KDTree(allPoints);
 
     // 時間いっぱい探索する
     var bestPalette = new Palette();
@@ -1472,7 +1479,8 @@ public static class Program
 
       // 仕切りの設計
       // int dividerUpPercent = _rand.Next(30, 50);
-      int dividerUpPercent = 100;
+      // int dividerUpPercent = 100;
+      int dividerUpPercent = Math.Max(100 - searchCount, 0);
       bool[,] verticalDividers = new bool[N, N - 1];
       bool[,] horizontalDividers = new bool[N - 1, N];
       for (int i = 0; i < N; i++)
@@ -1539,7 +1547,8 @@ public static class Program
         var well = plt.GetWell(wellId);
         Coord representative = plt.GetCellsInWell(wellId).First();
 
-        var nearest = kdt.FindNearest(Targets[wellCount], well.Capacity);
+        int searchTurn = Math.Min(well.Capacity, PrecomputeData[K].MixingCount);
+        var nearest = kdtree[searchTurn].FindNearest(Targets[wellCount], searchTurn);
         var tubeIds = colorToTubeIds[(CMY)nearest?.Color];
 
         foreach (int tubeId in tubeIds)
@@ -1576,7 +1585,8 @@ public static class Program
           // 空のウェルに最適な絵の具を作り出す
           if (well.Volume < 1e-6)
           {
-            var nearest = kdt.FindNearest(Targets[plt.TargetId], well.Capacity);
+            int searchTurn = Math.Min(well.Capacity, PrecomputeData[K].MixingCount);
+            var nearest = kdtree[searchTurn].FindNearest(Targets[plt.TargetId], searchTurn);
             var tubeIds = colorToTubeIds[(CMY)nearest?.Color];
 
             List<int[]> operations = new();
