@@ -111,6 +111,8 @@ public struct CMY
 
   [MethodImpl(256)] public static CMY operator +(CMY a, CMY b) => new CMY(a.C + b.C, a.M + b.M, a.Y + b.Y);
 
+  [MethodImpl(256)] public static CMY operator -(CMY a, CMY b) => new CMY(a.C - b.C, a.M - b.M, a.Y - b.Y);
+
   [MethodImpl(256)] public static CMY operator *(double scalar, CMY cmy) => new CMY(scalar * cmy.C, scalar * cmy.M, scalar * cmy.Y);
 
   [MethodImpl(256)] public static CMY operator *(CMY cmy, double scalar) => scalar * cmy;
@@ -162,6 +164,238 @@ public static class CMYExtensions
       sum += item;
     }
     return sum;
+  }
+}
+
+/// <summary>
+/// KD木クラス。
+/// (CMY Color, int Turn) のタプルを扱う。
+/// </summary>
+public class KDTree
+{
+  /// <summary>
+  /// KD木のノードを表す、KDTreeクラス専用の内部クラス。
+  /// </summary>
+  private class Node
+  {
+    /// <summary>
+    /// ノードが保持するデータポイント（色とターン数）。
+    /// </summary>
+    public (CMY Color, int Turn) Point { get; }
+
+    /// <summary>
+    /// このノードで空間を分割する軸 (0:C, 1:M, 2:Y)。
+    /// </summary>
+    public int Axis { get; }
+
+    /// <summary>
+    /// 左の子ノード（このノードの分割軸において値が小さい側）。
+    /// </summary>
+    public Node Left { get; set; }
+
+    /// <summary>
+    /// 右の子ノード（このノードの分割軸において値が大きい側）。
+    /// </summary>
+    public Node Right { get; set; }
+
+    /// <summary>
+    /// Nodeクラスの新しいインスタンスを初期化します。
+    /// </summary>
+    /// <param name="point">ノードが保持するデータポイント。</param>
+    /// <param name="axis">このノードでの分割軸。</param>
+    public Node((CMY Color, int Turn) point, int axis)
+    {
+      Point = point;
+      Axis = axis;
+    }
+  }
+
+  /// <summary>
+  /// KD木を構成する点の内部配列。構築後は変更されません。
+  /// </summary>
+  private readonly (CMY Color, int Turn)[] points;
+
+  /// <summary>
+  /// KD木のルートノード。
+  /// </summary>
+  private Node Root { get; }
+
+  /// <summary>
+  /// KDTreeクラスの新しいインスタンスを初期化し、指定された点のリストから木を構築します。
+  /// </summary>
+  /// <param name="initialPoints">木の構築に使用する点のリスト。(CMY Color, int Turn)のタプル形式です。</param>
+  public KDTree(IList<(CMY Color, int Turn)> initialPoints)
+  {
+    this.points = initialPoints.ToArray();
+    this.Root = Build(0, this.points.Length - 1, 0);
+  }
+
+  /// <summary>
+  /// 指定された範囲の点を使用して、再帰的にKD木を構築します。
+  /// </summary>
+  /// <param name="left">処理範囲の開始インデックス。</param>
+  /// <param name="right">処理範囲の終了インデックス。</param>
+  /// <param name="depth">現在の木の深さ。分割軸の決定に使用します。</param>
+  /// <returns>構築された部分木のルートノード。</returns>
+  private Node Build(int left, int right, int depth)
+  {
+    if (left > right) return null;
+    int axis = depth % 3;
+    int mid = left + (right - left) / 2;
+    FindMedianAndPartition(left, right, mid, axis);
+    var node = new Node(this.points[mid], axis);
+    node.Left = Build(left, mid - 1, depth + 1);
+    node.Right = Build(mid + 1, right, depth + 1);
+    return node;
+  }
+
+  /// <summary>
+  /// 指定範囲内のk番目に小さい要素（中央値）を見つけ、その要素を基準に配列を分割します。
+  /// この操作はインプレース（元の配列を直接変更）で行われます。
+  /// </summary>
+  /// <param name="left">処理範囲の開始インデックス。</param>
+  /// <param name="right">処理範囲の終了インデックス。</param>
+  /// <param name="k">見つけたい要素のインデックス（中央値のインデックス）。</param>
+  /// <param name="axis">比較に使用する次元 (0:C, 1:M, 2:Y)。</param>
+  private void FindMedianAndPartition(int left, int right, int k, int axis)
+  {
+    while (left < right)
+    {
+      int pivotIndex = Partition(left, right, axis);
+      if (pivotIndex == k) return;
+      if (pivotIndex < k) left = pivotIndex + 1;
+      else right = pivotIndex - 1;
+    }
+  }
+
+  /// <summary>
+  /// 配列の指定範囲を、ピボット要素を基準に分割します。
+  /// ピボットより小さいすべての要素がピボットの左に来るように配置します。
+  /// </summary>
+  /// <param name="left">処理範囲の開始インデックス。</param>
+  /// <param name="right">処理範囲の終了インデックス。この位置の要素がピボットとして使われます。</param>
+  /// <param name="axis">比較に使用する次元。</param>
+  /// <returns>分割後のピボットの最終的なインデックス。</returns>
+  private int Partition(int left, int right, int axis)
+  {
+    int pivotIndex = right;
+    var pivotValue = this.points[pivotIndex];
+    int storeIndex = left;
+    Swap(pivotIndex, right);
+    for (int i = left; i < right; i++)
+    {
+      if (GetValueByAxis(this.points[i].Color, axis) < GetValueByAxis(pivotValue.Color, axis))
+      {
+        Swap(i, storeIndex);
+        storeIndex++;
+      }
+    }
+    Swap(storeIndex, right);
+    return storeIndex;
+  }
+
+  /// <summary>
+  /// 内部配列の2つの要素を交換します。
+  /// </summary>
+  /// <param name="a">交換する要素のインデックス。</param>
+  /// <param name="b">交換するもう一方の要素のインデックス。</param>
+  [MethodImpl(256)]
+  private void Swap(int a, int b)
+  {
+    var temp = this.points[a];
+    this.points[a] = this.points[b];
+    this.points[b] = temp;
+  }
+
+  /// <summary>
+  /// 指定された色とターン数上限に合致する、最も近い点（最近傍点）を探します。
+  /// 距離が同じ候補が複数ある場合は、ターン数が最も小さいものが選択されます。
+  /// </summary>
+  /// <param name="targetColor">検索の基準となる目標のCMY色。</param>
+  /// <param name="maxTurn">許容される最大のターン数。この値以下のターンを持つ点のみが検索対象となります。</param>
+  /// <returns>条件に合致する最も近い点。見つからない場合はnullを返します。</returns>
+  public (CMY Color, int Turn)? FindNearest(CMY targetColor, int maxTurn)
+  {
+    if (Root == null) return null;
+    Node? bestNode = null;
+    double bestDist = double.MaxValue;
+    FindNearest(Root, targetColor, maxTurn, ref bestNode, ref bestDist);
+    return bestNode?.Point;
+  }
+
+  /// <summary>
+  /// 最近傍点を探索するための再帰的なヘルパーメソッド。
+  /// 候補の更新は、(1)より距離が近い場合、または(2)距離が同じでターン数が小さい場合に行われます。
+  /// </summary>
+  /// <param name="currentNode">現在訪問中のノード。</param>
+  /// <param name="targetColor">目標のCMY色。</param>
+  /// <param name="maxTurn">許容される最大のターン数。</param>
+  /// <param name="bestNode">現在見つかっている最近傍ノードへの参照。</param>
+  /// <param name="bestDist">現在見つかっている最近傍点までの距離（の2乗）への参照。</param>
+  private void FindNearest(Node currentNode, CMY targetColor, int maxTurn, ref Node? bestNode, ref double bestDist)
+  {
+    if (currentNode == null) return;
+
+    if (currentNode.Point.Turn <= maxTurn)
+    {
+      double d = GetSquaredDistance(targetColor, currentNode.Point.Color);
+
+      bool shouldUpdate = false;
+      if (bestNode == null || d < bestDist)
+      {
+        shouldUpdate = true;
+      }
+      else if (d == bestDist && currentNode.Point.Turn < bestNode.Point.Turn)
+      {
+        shouldUpdate = true;
+      }
+
+      if (shouldUpdate)
+      {
+        bestDist = d;
+        bestNode = currentNode;
+      }
+    }
+
+    int axis = currentNode.Axis;
+    double targetVal = GetValueByAxis(targetColor, axis);
+    double nodeVal = GetValueByAxis(currentNode.Point.Color, axis);
+    Node goodSide = (targetVal < nodeVal) ? currentNode.Left : currentNode.Right;
+    Node badSide = (targetVal < nodeVal) ? currentNode.Right : currentNode.Left;
+    FindNearest(goodSide, targetColor, maxTurn, ref bestNode, ref bestDist);
+    double distToPlaneSq = (targetVal - nodeVal) * (targetVal - nodeVal);
+    if (distToPlaneSq < bestDist)
+    {
+      FindNearest(badSide, targetColor, maxTurn, ref bestNode, ref bestDist);
+    }
+  }
+
+  /// <summary>
+  /// CMY色の指定された軸の値を取得します。
+  /// </summary>
+  /// <param name="color">値を取得する対象のCMY色。</param>
+  /// <param name="axis">軸 (0:C, 1:M, 2:Y)。</param>
+  /// <returns>指定された軸の成分値。</returns>
+  [MethodImpl(256)]
+  private static double GetValueByAxis(CMY color, int axis)
+  {
+    return axis == 0 ? color.C : (axis == 1 ? color.M : color.Y);
+  }
+
+  /// <summary>
+  /// 2つのCMY色間のユークリッド距離の2乗を計算します。
+  /// 平方根の計算を省略することで、距離の大小比較を高速に行えます。
+  /// </summary>
+  /// <param name="p1">1つ目のCMY色。</param>
+  /// <param name="p2">2つ目のCMY色。</param>
+  /// <returns>2点間の距離の2乗。</returns>
+  [MethodImpl(256)]
+  public static double GetSquaredDistance(CMY p1, CMY p2)
+  {
+    double dc = p1.C - p2.C;
+    double dm = p1.M - p2.M;
+    double dy = p1.Y - p2.Y;
+    return dc * dc + dm * dm + dy * dy;
   }
 }
 
@@ -742,6 +976,32 @@ public class Palette : Grid
 public static class Program
 {
   public static readonly long Timeout = 2950;
+  // public static readonly int[] PrecomputableCount = new int[] { -1, -1, -1, -1, 10, 8, 7, 6, 6, 6, 6, 6, 5, 5, 5, 5, 5, 5, 5, 4, 4 };
+  public static readonly (int MixingCount, int CalcCount)[] PrecomputeData = new (int, int)[]
+  {
+    (-1, -1),
+    (-1, -1),
+    (-1, -1),
+    (-1, -1),
+    (8, 87380),
+    (7, 97655),
+    (6, 55986),
+    (6, 137256),
+    (5, 37448),
+    (5, 66429),
+    (5, 111110),
+    (5, 177155),
+    (4, 22620),
+    (4, 30940),
+    (4, 41370),
+    (4, 54240),
+    (4, 69904),
+    (4, 88740),
+    (4, 111150),
+    (4, 137560),
+    (4, 168420)
+  };
+
   public static readonly int[] DY = new int[] { -1, 0, 1, 0 };
   public static readonly int[] DX = new int[] { 0, 1, 0, -1 };
   private static readonly Random _rand = new();
@@ -760,7 +1020,9 @@ public static class Program
     TimeKeeper.Start();
     Input();
     // Greedy();
-    Greedy2();
+    // Greedy2();
+    // Greedy3();
+    Greedy4();
   }
 
   public static void Input()
@@ -1070,5 +1332,97 @@ public static class Program
 
     Error.WriteLine($"finish! searchCount={searchCount}");
     bestPalette.Print();
+  }
+
+  public static void Greedy3()
+  {
+    // 数ターン分、絵の具の組み合わせを全探索する
+    // 作成した色から使用した絵の具の組み合わせを解決する辞書も同時に作成する
+    var points = new (CMY Color, int Turn)[PrecomputeData[K].CalcCount];
+    Dictionary<CMY, int[]> colorToTubeIds = new();
+    int idx = 0;
+    for (int mcnt = 1; mcnt <= PrecomputeData[K].MixingCount; mcnt++)
+    {
+      int[] tubeIds = new int[mcnt];
+      CMY colorSum = tubeIds.Select((id) => Tubes[id]).Sum();
+
+      for (int i = 0; i < (int)Math.Pow(K, mcnt); i++)
+      {
+        CMY color = colorSum / mcnt;
+        points[idx] = (color, mcnt);
+        if (!colorToTubeIds.ContainsKey(color))
+        {
+          colorToTubeIds[color] = new int[tubeIds.Length];
+          for (int j = 0; j < tubeIds.Length; j++) colorToTubeIds[color][j] = tubeIds[j];
+        }
+        idx++;
+
+        for (int pos = mcnt - 1; pos >= 0; pos--)
+        {
+          colorSum -= Tubes[tubeIds[pos]];
+          tubeIds[pos]++;
+
+          if (tubeIds[pos] < K)
+          {
+            colorSum += Tubes[tubeIds[pos]];
+            break;
+          }
+
+          tubeIds[pos] = 0;
+          colorSum += Tubes[tubeIds[pos]];
+        }
+      }
+    }
+
+    // 調合で完成した色とかかったターンの情報がまとまっているリストを渡してKD木を構築
+    var kdt = new KDTree(points);
+
+    // コストと操作可能な回数から1回の調合にかけられる操作回数
+    int maxMixingCount = Math.Max(
+      1,
+      Math.Min(
+        PrecomputeData[K].MixingCount,
+        T / H / 2
+      )
+    );
+
+    var bestPlt = new Palette();
+    for (int mixingCount = 1; mixingCount <= maxMixingCount; mixingCount++)
+    {
+      var plt = new Palette();
+      for (int i = 0; i < H; i++)
+      {
+
+        // KD木から最適なパターンを取得する
+        // int mixingCount = Math.Min(maxMixingCount, PrecomputeData[K].MixingCount);
+        var nearest = kdt.FindNearest(Targets[plt.TargetId], mixingCount);
+        var tubeIds = colorToTubeIds[(CMY)nearest?.Color];
+
+        foreach (int tubeId in tubeIds)
+        {
+          plt.Operate(new int[] { 1, 0, 0, tubeId });
+        }
+
+        for (int j = 0; j < tubeIds.Length; j++)
+        {
+          if (j == 0) plt.Operate(new int[] { 2, 0, 0 });
+          else plt.Operate(new int[] { 3, 0, 0 });
+        }
+      }
+
+      Error.WriteLine($"mixingCount: {mixingCount} score={plt.EvaluatedScore}");
+      if (plt.EvaluatedScore < bestPlt.EvaluatedScore)
+      {
+        bestPlt = plt;
+      }
+    }
+
+    bestPlt.Print();
+  }
+
+  public static void Greedy4()
+  {
+    if (D >= 100) Greedy2();
+    else Greedy3();
   }
 }
