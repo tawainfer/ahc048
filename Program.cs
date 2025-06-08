@@ -911,7 +911,10 @@ public class Palette : Grid
   [MethodImpl(256)]
   public double GetScoreDeltaByAddition(int addCount, CMY color)
   {
-    return Cost * addCount + 1e4 * CMY.Distance(color, Targets[TargetId]).All;
+    return Cost * addCount
+      * (Math.Min(AddCount, ((double)Targets.Count / 2)) / ((double)Targets.Count / 2)) // 追加回数が1000回未満の場合、優遇する
+      * ((MadePaints.Count != 0 ? AddCount / (double)MadePaints.Count : 1.0)) // 完成させたターゲットの数に対して絵の具を使いすぎている場合は冷遇する
+      + 1e4 * CMY.Distance(color, Targets[TargetId]).All;
   }
 
   // ターン数が残っていて操作可能な状態かどうか判定する
@@ -1002,49 +1005,49 @@ public static class Program
   // public static readonly int[] PrecomputableCount = new int[] { -1, -1, -1, -1, 10, 8, 7, 6, 6, 6, 6, 6, 5, 5, 5, 5, 5, 5, 5, 4, 4 };
   public static readonly (int MixingCount, int CalcCount)[] PrecomputeData = new (int, int)[]
   {
-    // (-1, -1),
-    // (-1, -1),
-    // (-1, -1),
-    // (-1, -1),
-    // (8, 87380),
-    // (7, 97655),
-    // (6, 55986),
-    // (6, 137256),
-    // (5, 37448),
-    // (5, 66429),
-    // (5, 111110),
-    // (5, 177155),
-    // (4, 22620),
-    // (4, 30940),
-    // (4, 41370),
-    // (4, 54240),
-    // (4, 69904),
-    // (4, 88740),
-    // (4, 111150),
-    // (4, 137560),
-    // (4, 168420)
-
     (-1, -1),
     (-1, -1),
     (-1, -1),
     (-1, -1),
-    (9, 349524),
-    (8, 488280),
-    (7, 335922),
+    (8, 87380),
+    (7, 97655),
+    (6, 55986),
     (6, 137256),
-    (6, 299592),
-    (6, 597870),
-    (6, 1111110),
+    (5, 37448),
+    (5, 66429),
+    (5, 111110),
     (5, 177155),
-    (5, 271452),
-    (5, 402233),
-    (5, 579194),
-    (5, 813615),
-    (5, 1118480),
+    (4, 22620),
+    (4, 30940),
+    (4, 41370),
+    (4, 54240),
+    (4, 69904),
     (4, 88740),
     (4, 111150),
     (4, 137560),
     (4, 168420)
+
+    // (-1, -1),
+    // (-1, -1),
+    // (-1, -1),
+    // (-1, -1),
+    // (9, 349524),
+    // (8, 488280),
+    // (7, 335922),
+    // (6, 137256),
+    // (6, 299592),
+    // (6, 597870),
+    // (6, 1111110),
+    // (5, 177155),
+    // (5, 271452),
+    // (5, 402233),
+    // (5, 579194),
+    // (5, 813615),
+    // (5, 1118480),
+    // (4, 88740),
+    // (4, 111150),
+    // (4, 137560),
+    // (4, 168420)
   };
 
   public static readonly int[] DY = new int[] { -1, 0, 1, 0 };
@@ -1627,83 +1630,123 @@ public static class Program
             }
           }
 
-          // 空のウェルに最適な絵の具を作り出して差し出す
-          if (well.Volume < 1e-6)
+          // // ウェルに絵の具を追加して差し出す
+          int maxGramsToAdd = PrecomputeData[K].MixingCount;
+          for (int n = 1; n <= maxGramsToAdd; n++)
           {
-            int searchTurn = Math.Min(well.Capacity, PrecomputeData[K].MixingCount);
-            var nearest = kdtree[searchTurn].FindNearest(Targets[plt.TargetId], searchTurn);
-            var tubeIds = colorToTubeIds[(CMY)nearest?.Color];
+            // ウェルの容量が足りない場合はスキップ
+            if (well.Volume + n > well.Capacity + 1e-6) break;
 
-            List<int[]> operations = new();
-            foreach (int tubeId in tubeIds)
-            {
-              operations.Add(new int[] { 1, representative.Y, representative.X, tubeId });
-            }
-            operations.Add(new int[] { 2, representative.Y, representative.X });
+            // ウェルの状態から理想的な追加分の絵の具を求める
+            CMY targetColor = Targets[plt.TargetId];
+            CMY idealAdditiveColor = (targetColor * (well.Volume + n) - well.Color * well.Volume) / n;
 
-            double scoreDelta = plt.GetScoreDeltaByAddition(
-              Math.Min(tubeIds.Length, Math.Max(plt.AddCount - H, 0)),
-              (CMY)nearest?.Color);
-            if (scoreDelta < bestOperate.scoreDelta)
-            {
-              bestOperate = ((CMY)nearest?.Color, scoreDelta, operations);
-            }
-          }
+            // n回混ぜて作れる色の中から理想に最も近い色をKD木から検索
+            var nearest = kdtree[n].FindNearest(idealAdditiveColor, n);
 
-          // ウェルに1gの絵の具を追加して差し出す
-          if (well.Volume + 1 < well.Capacity + 1e-6)
-          {
-            for (int tubeId = 0; tubeId < Tubes.Count; tubeId++)
+            if (nearest.HasValue)
             {
-              CMY tube = Tubes[tubeId];
-              var tmpCell = well + new Cell(tube, 1, 0);
+              // 3. 実際に追加した場合の最終的な色とスコアを評価
+              CMY additiveColor = nearest.Value.Color;
+              var finalWell = well + new Cell(additiveColor, n, 0);
+
               double scoreDelta = plt.GetScoreDeltaByAddition(
-                Math.Min(1, Math.Max(plt.AddCount - H, 0)),
-                tmpCell.Color);
+                  // Math.Min(n - 1, Math.Max(plt.AddCount - H, 0)),
+                  // n - 1,
+                  (plt.AddCount < 1000 ? n - 1 : n),
+                  finalWell.Color
+              );
+
               if (scoreDelta < bestOperate.scoreDelta)
               {
-                bestOperate = (tmpCell.Color, scoreDelta, new() {
-                  new int[] { 1, representative.Y, representative.X, tubeId },
-                  new int[] { 2, representative.Y, representative.X }
-                });
+                var tubeIds = colorToTubeIds[additiveColor];
+                List<int[]> operations = new();
+                foreach (int tubeId in tubeIds)
+                {
+                  operations.Add(new int[] { 1, representative.Y, representative.X, tubeId });
+                }
+                operations.Add(new int[] { 2, representative.Y, representative.X });
+
+                bestOperate = (finalWell.Color, scoreDelta, operations);
               }
             }
           }
         }
 
-        // 終盤で新しい絵の具を使いづらく盤面の絵の具も限られてきた場合に仕切りを破壊する
-        if (plt.TargetId >= 900 && bestOperate.scoreDelta >= 1000)
+        // 仕切りを破壊し異なるウェルを合体させてから差し出す
+        for (int sy = 1; sy < N - 1; sy += 2)
         {
-          Error.WriteLine($"plt.TargetId: {plt.TargetId} bestOperate.scoreDelta: {bestOperate.scoreDelta}");
-
-          for (int sy = 0; sy < N - 1; sy++)
+          for (int sx = 1; sx < N - 1; sx += 2)
           {
-            for (int sx = 0; sx < N - 1; sx++)
+            for (int b = 1; b <= 3; b++)
             {
-              for (int b = 0; b < 2; b++)
+              Coord c1 = new(sy, sx);
+              var w1 = plt.GetWell(c1);
+              var mergedWell = w1;
+              List<int[]> operations = new();
+
+              if (b == 1)
               {
-                // 仕切りを破壊し異なるウェルを合体させてから差し出す
-                Coord c1 = new(sy, sx);
-                bool isVertical = (b == 0);
-                Coord c2 = (isVertical ? new(c1.Y, c1.X + 1) : new(c1.Y + 1, c1.X));
+                Coord c2 = new(c1.Y, c1.X + 1);
                 if (c2.Y < 0 || c2.Y >= N || c2.X < 0 || c2.X >= N) continue;
                 if (plt.IsSameWell(c1, c2)) continue;
 
-                var w1 = plt.GetWell(c1);
-                var w2 = plt.GetWell(c2);
-                var mergedWell = w1 + w2;
-                if (mergedWell.Volume < 1 - 1e-6) continue;
-
-                // CMY tube = Tubes[tubeId];
-                // var tmpCell = well + new Cell(tube, 1, 0);
-                double scoreDelta = plt.GetScoreDeltaByAddition(0, mergedWell.Color);
-                if (scoreDelta < bestOperate.scoreDelta)
-                {
-                  bestOperate = (mergedWell.Color, scoreDelta, new() {
+                mergedWell += plt.GetWell(c2);
+                operations.AddRange(new List<int[]>{
                     new int[] { 4, c1.Y, c1.X, c2.Y, c2.X },
-                    new int[] { 2, c1.Y, c1.X }
+                    new int[] { 2, c1.Y, c1.X },
+                    new int[] { 4, c1.Y, c1.X, c2.Y, c2.X }
                   });
+              }
+              else if (b == 2)
+              {
+                Coord c3 = new(c1.Y + 1, c1.X);
+                if (c3.Y < 0 || c3.Y >= N || c3.X < 0 || c3.X >= N) continue;
+                if (plt.IsSameWell(c1, c3)) continue;
+
+                mergedWell += plt.GetWell(c3);
+                operations.AddRange(new List<int[]>{
+                    new int[] { 4, c1.Y, c1.X, c3.Y, c3.X },
+                    new int[] { 2, c1.Y, c1.X },
+                    new int[] { 4, c1.Y, c1.X, c3.Y, c3.X }
+                  });
+              }
+              else if (b == 3)
+              {
+                Coord c2 = new(c1.Y, c1.X + 1);
+                if (c2.Y < 0 || c2.Y >= N || c2.X < 0 || c2.X >= N) continue;
+                if (plt.IsSameWell(c1, c2)) continue;
+
+                Coord c3 = new(c1.Y + 1, c1.X);
+                if (c3.Y < 0 || c3.Y >= N || c3.X < 0 || c3.X >= N) continue;
+                if (plt.IsSameWell(c1, c3)) continue;
+                if (plt.IsSameWell(c2, c3)) continue;
+
+                mergedWell += plt.GetWell(c2);
+                mergedWell += plt.GetWell(c3);
+                operations.AddRange(new List<int[]>{
+                    new int[] { 4, c1.Y, c1.X, c2.Y, c2.X },
+                    new int[] { 4, c1.Y, c1.X, c3.Y, c3.X },
+                    new int[] { 2, c1.Y, c1.X },
+                    new int[] { 4, c1.Y, c1.X, c3.Y, c3.X },
+                    new int[] { 4, c1.Y, c1.X, c2.Y, c2.X }
+                  });
+              }
+              if (mergedWell.Volume < 1 - 1e-6) continue;
+
+              // CMY tube = Tubes[tubeId];
+              // var tmpCell = well + new Cell(tube, 1, 0);
+              double scoreDelta = plt.GetScoreDeltaByAddition(0, mergedWell.Color);
+              if (scoreDelta < bestOperate.scoreDelta)
+              {
+                if (plt.TargetId >= 1000 - (D / 50) - 100)
+                {
+                  while (operations.Last()[0] == 4)
+                  {
+                    operations.RemoveAt(operations.Count - 1);
+                  }
                 }
+                bestOperate = (mergedWell.Color, scoreDelta, operations);
               }
             }
           }
