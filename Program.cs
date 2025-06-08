@@ -567,6 +567,18 @@ public class Grid
     return new Cell(cell.Color, cell.Volume * group.Count, cell.Capacity * group.Count);
   }
 
+  [MethodImpl(256)]
+  public int GetWellId(Coord coord) => GetWellId(coord.Y, coord.X);
+
+  [MethodImpl(256)]
+  public int GetWellId(int y, int x) => _wellId[y, x];
+
+  [MethodImpl(256)]
+  public bool IsSameWell(Coord c1, Coord c2) => IsSameWell(c1.Y, c1.X, c2.Y, c2.X);
+
+  [MethodImpl(256)]
+  public bool IsSameWell(int y1, int x1, int y2, int x2) => _wellId[y1, x1] == _wellId[y2, x2];
+
   // ウェルに属するセルの一覧を取得する
   [MethodImpl(256)]
   public IReadOnlyCollection<Coord> GetCellsInWell(int wellId)
@@ -783,6 +795,7 @@ public class Grid
       {
         Write($"{(vertical[i, j] ? 1 : 0)} ");
       }
+      WriteLine();
     }
     for (int i = 0; i < horizontal.GetLength(0); i++)
     {
@@ -790,6 +803,7 @@ public class Grid
       {
         Write($"{(horizontal[i, j] ? 1 : 0)} ");
       }
+      WriteLine();
     }
   }
 
@@ -970,6 +984,15 @@ public class Palette : Grid
       WriteLine(string.Join(' ', log));
       if (verbose) Error.WriteLine($"Visualized: {v}, Evaluated: {e}");
     }
+
+    if (verbose)
+    {
+      for (int i = 0; i < MadePaints.Count; i++)
+      {
+        Error.Write($"delta: {MadePaints[i].Deviation}\t");
+        Error.WriteLine($"target[{i}]: {Targets[i]}\t<---> made[{i}]: {MadePaints[i].Color}");
+      }
+    }
   }
 }
 
@@ -979,23 +1002,45 @@ public static class Program
   // public static readonly int[] PrecomputableCount = new int[] { -1, -1, -1, -1, 10, 8, 7, 6, 6, 6, 6, 6, 5, 5, 5, 5, 5, 5, 5, 4, 4 };
   public static readonly (int MixingCount, int CalcCount)[] PrecomputeData = new (int, int)[]
   {
+    // (-1, -1),
+    // (-1, -1),
+    // (-1, -1),
+    // (-1, -1),
+    // (8, 87380),
+    // (7, 97655),
+    // (6, 55986),
+    // (6, 137256),
+    // (5, 37448),
+    // (5, 66429),
+    // (5, 111110),
+    // (5, 177155),
+    // (4, 22620),
+    // (4, 30940),
+    // (4, 41370),
+    // (4, 54240),
+    // (4, 69904),
+    // (4, 88740),
+    // (4, 111150),
+    // (4, 137560),
+    // (4, 168420)
+
     (-1, -1),
     (-1, -1),
     (-1, -1),
     (-1, -1),
-    (8, 87380),
-    (7, 97655),
-    (6, 55986),
+    (9, 349524),
+    (8, 488280),
+    (7, 335922),
     (6, 137256),
-    (5, 37448),
-    (5, 66429),
-    (5, 111110),
+    (6, 299592),
+    (6, 597870),
+    (6, 1111110),
     (5, 177155),
-    (4, 22620),
-    (4, 30940),
-    (4, 41370),
-    (4, 54240),
-    (4, 69904),
+    (5, 271452),
+    (5, 402233),
+    (5, 579194),
+    (5, 813615),
+    (5, 1118480),
     (4, 88740),
     (4, 111150),
     (4, 137560),
@@ -1468,7 +1513,7 @@ public static class Program
 
       kdtree[mcnt] = new KDTree(currentPoints);
     }
-    kdtree[0] = new KDTree(allPoints);
+    // kdtree[0] = new KDTree(allPoints);
 
     // 時間いっぱい探索する
     var bestPalette = new Palette();
@@ -1626,6 +1671,44 @@ public static class Program
           }
         }
 
+        // 終盤で新しい絵の具を使いづらく盤面の絵の具も限られてきた場合に仕切りを破壊する
+        if (plt.TargetId >= 900 && bestOperate.scoreDelta >= 1000)
+        {
+          Error.WriteLine($"plt.TargetId: {plt.TargetId} bestOperate.scoreDelta: {bestOperate.scoreDelta}");
+
+          for (int sy = 0; sy < N - 1; sy++)
+          {
+            for (int sx = 0; sx < N - 1; sx++)
+            {
+              for (int b = 0; b < 2; b++)
+              {
+                // 仕切りを破壊し異なるウェルを合体させてから差し出す
+                Coord c1 = new(sy, sx);
+                bool isVertical = (b == 0);
+                Coord c2 = (isVertical ? new(c1.Y, c1.X + 1) : new(c1.Y + 1, c1.X));
+                if (c2.Y < 0 || c2.Y >= N || c2.X < 0 || c2.X >= N) continue;
+                if (plt.IsSameWell(c1, c2)) continue;
+
+                var w1 = plt.GetWell(c1);
+                var w2 = plt.GetWell(c2);
+                var mergedWell = w1 + w2;
+                if (mergedWell.Volume < 1 - 1e-6) continue;
+
+                // CMY tube = Tubes[tubeId];
+                // var tmpCell = well + new Cell(tube, 1, 0);
+                double scoreDelta = plt.GetScoreDeltaByAddition(0, mergedWell.Color);
+                if (scoreDelta < bestOperate.scoreDelta)
+                {
+                  bestOperate = (mergedWell.Color, scoreDelta, new() {
+                    new int[] { 4, c1.Y, c1.X, c2.Y, c2.X },
+                    new int[] { 2, c1.Y, c1.X }
+                  });
+                }
+              }
+            }
+          }
+        }
+
         // 最も良い手順に従って操作を行う
         foreach (var operation in bestOperate.Operations)
         {
@@ -1634,7 +1717,7 @@ public static class Program
       }
 
       // 評価スコアが元より高くなるなら更新する
-      if (plt.EvaluatedScore < bestPalette.EvaluatedScore)
+      if (plt.IsSubmittable() && plt.EvaluatedScore < bestPalette.EvaluatedScore)
       {
         Error.WriteLine($"update! searchCount={searchCount} dividerUpPercent={dividerUpPercent}");
         Error.WriteLine($"{bestPalette.EvaluatedScore} -> {plt.EvaluatedScore}");
@@ -1644,5 +1727,6 @@ public static class Program
 
     Error.WriteLine($"searchCount: {searchCount}");
     bestPalette.Print();
+    // bestPalette.Print(verbose: true);
   }
 }
